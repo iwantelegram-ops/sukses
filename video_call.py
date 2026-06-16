@@ -75,6 +75,14 @@ USERBOT_PHONE = os.environ.get("USERBOT_PHONE", "").strip()
 _BOT_DIR    = _Path(__file__).resolve().parent
 _UB_SESSION = str(_BOT_DIR / "userbot_security_os")
 
+_VC_JOIN_MAX_RETRIES = 3      # Maksimal percobaan ulang per grup
+_VC_JOIN_RETRY_SECS  = 15.0   # Jeda antar percobaan ulang (detik)
+
+_MAX_PARALLEL_GROUP_SCANS = 3  # dipertahankan untuk kompatibilitas
+
+_VC_KEEPALIVE_INTERVAL = 600    # detik — cek tiap 30 detik (Telegram bisa kick dalam ~30 detik)
+_VC_HEARTBEAT_INTERVAL  = 10    # detik — sinyal "masih di sini" ke Telegram
+
 # ── State global ──────────────────────────────────────────────────────────────
 userbot: _Client | None = None   # instance userbot Pyrogram
 _bot_ref: _Client | None = None  # referensi bot biasa (untuk kirim peringatan)
@@ -976,10 +984,6 @@ async def _voice_chat_monitor_loop() -> None:
     print("[UB] \U0001f507 Voice chat monitor berhenti.")
 
 
-_MAX_PARALLEL_GROUP_SCANS = 3  # dipertahankan untuk kompatibilitas
-
-_VC_KEEPALIVE_INTERVAL = 30    # detik — cek tiap 30 detik (Telegram bisa kick dalam ~30 detik)
-_VC_HEARTBEAT_INTERVAL  = 20    # detik — sinyal "masih di sini" ke Telegram
 
 
 async def _vc_keepalive_loop() -> None:
@@ -1300,9 +1304,6 @@ async def _auto_join_active_voice_chats() -> None:
 
     from pyrogram.raw import functions as _rf
     from pyrogram.raw.types import InputGroupCall, DataJSON
-
-    _VC_JOIN_MAX_RETRIES = 3      # Maksimal percobaan ulang per grup
-    _VC_JOIN_RETRY_SECS  = 15.0   # Jeda antar percobaan ulang (detik)
 
     joined_count = 0
     for doc in docs:

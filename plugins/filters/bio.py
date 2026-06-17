@@ -65,9 +65,9 @@ LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", 0))
 # Cache ini hanya dipakai saat data BARU saja di-fetch (< 5 menit).
 # Setelah TTL DB habis, cache ini juga akan expired (TTL sama = 300 detik).
 _mem_cache: dict[tuple[int, int], tuple[bool, float]] = {}
-# TTL cache HARUS ikut BIO_TTL_SECS — jika user hapus link dari bio,
-# cache expired bersamaan dengan data DB sehingga bot baca data fresh.
-_MEM_CACHE_TTL = float(os.environ.get("BIO_TTL_SECS", 300))
+# BUG 3 FIX: TTL 60 detik — sinkron dengan BIO_TTL_SECS (monitor_bot) &
+# _BIO_CACHE_TTL (userbot). Semua layer cache hancur dalam waktu yang sama.
+_MEM_CACHE_TTL = float(os.environ.get("BIO_TTL_SECS", 60))
 
 # ── Throttle typing handler bot utama ─────────────────────────────────────────
 # Untuk mencegah force_check_user dipanggil terlalu sering dari sisi bot utama.
@@ -150,18 +150,25 @@ async def bio_filter(client: Client, message: Message):
     # ── Step 1: Cek data dari DB (data bot pemantau grup ini) ─────────────────
     has_link = await _query_bio_for_group(cid, uid)
 
-    # ── Step 2: Tidak ada data → lempar ke bot pemantau ───────────────────────
+    # ── Step 2: Tidak ada data → paksa bot pemantau cek langsung ─────────────
     if has_link is None:
         try:
             from monitor_bot_reference import force_check_user
             has_link = await force_check_user(cid, uid)
-            # Update memory cache dengan hasil fresh
             if has_link is not None:
                 _update_mem_cache(cid, uid, has_link)
         except Exception:
             pass
+        # BUG 4+5 FIX: Jika bot pemantau tidak bisa cek (user tidak dikenali/bio kosong)
+        # → anggap tidak ada link (bio kosong = no link)
+        # → biarkan pesan lewat, jangan hapus tanpa data yang valid
         if has_link is None:
-            return  # Fallback aman: biarkan lewat jika tidak bisa cek
+            has_link = False   # bio kosong / tidak tersedia → dianggap no link
+            print(
+                f"[Bio-Filter] uid={uid} chat={cid}: "
+                "bio tidak tersedia dari bot pemantau — dianggap no link, pesan dilewat"
+            )
+            return  # Tidak ada link → pesan aman, lanjut
 
     # ── Step 3: Eksekusi jika ada link ────────────────────────────────────────
     if has_link:

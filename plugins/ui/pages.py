@@ -410,7 +410,7 @@ async def page_manage(chat_id: int):
         f"🔇 <b>Mute Eskalasi</b>  —  <code>🟢 AKTIF</code>\n"
         f"<i>   10 spam berturut-turut → mute otomatis (berlipat).</i>\n\n"
         f"{sec_icon} <b>Security OS</b>  —  <code>{sec_flag}</code>{ub_hint}\n"
-        f"<i>   Turunkan user bio-link dari obrolan suara via userbot.</i>\n\n"
+        f"<i>   Mute mic user non-member &amp; bio-link di obrolan suara via userbot.</i>\n\n"
         f"<i>Tap tombol di bawah untuk ubah pengaturan secara instan.</i>"
     )
     keyboard = InlineKeyboardMarkup([
@@ -792,8 +792,9 @@ async def page_security_os(chat_id: int, client=None):
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"<b>📌 APA INI?</b>\n"
         f"Security OS mengawasi <b>obrolan suara (voice chat)</b> grup.\n"
-        f"Saat user naik ke obrolan suara, bot pemantau memeriksa bio profil mereka.\n"
-        f"Jika bio mengandung link → user <b>diturunkan otomatis</b> dan mendapat peringatan.\n\n"
+        f"Saat user naik ke obrolan suara, userbot memeriksa status keanggotaan &amp; bio profil mereka.\n"
+        f"• User <b>non-member</b> → mic <b>di-mute otomatis</b> (terlepas isi bio).\n"
+        f"• Bio mengandung link → mic <b>di-mute otomatis</b> dan user mendapat peringatan.\n\n"
         f"<b>📊 STATUS SYARAT AKTIVASI:</b>\n"
         f"  {'✅' if ub_ready else '❌'} Userbot      : <code>{ub_st}</code>\n"
         f"  {'✅' if has_mon else '❌'} Bot Pemantau : <code>{mon_st}</code>\n"
@@ -804,7 +805,7 @@ async def page_security_os(chat_id: int, client=None):
         f"◈ Tiap grup punya bot pemantau <b>masing-masing</b>.\n"
         f"◈ Bot pemantau hanya menjawab di grupnya sendiri.\n"
         f"◈ Jika user mempriv bio untuk grup tertentu → bot pemantau di grup itu\n"
-        f"   tidak akan melihat link → user <b>tidak diturunkan</b> di grup tersebut.\n"
+        f"   tidak akan melihat link → mic user <b>tidak di-mute</b> di grup tersebut.\n"
         f"◈ 1 bot pemantau hanya boleh dipakai di <b>1 grup</b>.\n"
     )
 

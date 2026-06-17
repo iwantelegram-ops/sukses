@@ -25,6 +25,13 @@ ATURAN UTAMA:
   - Semua data disimpan ke DB (MongoDB/SQLite) via db[] seperti bot asli.
   - Logika penyimpanan asli tidak diubah sama sekali.
 
+ARSITEKTUR VC (Scheduled Join — bukan keepalive):
+  - Security OS aktif → userbot join VC tiap 30 menit (bukan stay permanen).
+  - Saat join: scan semua peserta VC sekarang + peserta baru (UpdateGroupCallParticipants).
+  - Bot pemantau cek profil tiap user (cache 1 menit) → mute jika link, unmute jika bersih.
+  - Telegram kick userbot setelah ~30 detik — tidak masalah, tugas sudah selesai.
+  - Tidak ada keepalive, tidak ada rejoin loop — sudah terjadwal.
+
 FLOW STARTUP:
   1. antigcast.py start → bot biasa aktif
   2. start_userbot(app) dipanggil → cek session userbot
@@ -50,6 +57,9 @@ import asyncio
 import time
 import re as _re
 from pathlib import Path as _Path
+from datetime import datetime as _dt_vc, timezone as _tz_vc, timedelta as _td_vc
+
+_WIB_VC = _tz_vc(_td_vc(hours=7))
 
 from pyrogram import Client as _Client, filters as _filters
 from pyrogram.enums import ParseMode
@@ -71,17 +81,10 @@ API_ID        = int(os.environ.get("API_ID", 0))
 API_HASH      = os.environ.get("API_HASH", "")
 OWNER_ID      = int(os.environ.get("OWNER_ID", 0))
 USERBOT_PHONE = os.environ.get("USERBOT_PHONE", "").strip()
+LOG_OS        = int(os.environ.get("LOG_OS", 0))
 
 _BOT_DIR    = _Path(__file__).resolve().parent
 _UB_SESSION = str(_BOT_DIR / "userbot_security_os")
-
-_VC_JOIN_MAX_RETRIES = 3      # Maksimal percobaan ulang per grup
-_VC_JOIN_RETRY_SECS  = 15.0   # Jeda antar percobaan ulang (detik)
-
-_MAX_PARALLEL_GROUP_SCANS = 3  # dipertahankan untuk kompatibilitas
-
-_VC_KEEPALIVE_INTERVAL = 600    # detik — cek tiap 30 detik (Telegram bisa kick dalam ~30 detik)
-_VC_HEARTBEAT_INTERVAL  = 10    # detik — sinyal "masih di sini" ke Telegram
 
 # ── State global ──────────────────────────────────────────────────────────────
 userbot: _Client | None = None   # instance userbot Pyrogram
@@ -98,7 +101,25 @@ _last_vc_check: dict[int, float] = {}
 _VC_CHECK_INTERVAL = 15.0   # detik minimum antar scan VC per grup
 
 # ── Pelacak user yang sedang diproses (hindari double-kick) ──────────────────
-_processing_kick: set[tuple[int, int]] = set()   # {(chat_id, user_id)}
+_processing_kick: set[tuple[int, int]] = set()   # {(chat_id, user_id)} — cegah double-proses
+
+# ── Cache status member grup (TTL 2 menit) ────────────────────────────────────
+_member_cache: dict[tuple[int, int], tuple[bool, float]] = {}
+_MEMBER_CACHE_TTL = 120.0   # detik
+
+# ── Alasan warning tertunda (dihapus setelah _do_send_warning memakai) ────────
+_pending_warn_reason: dict[tuple[int, int], str] = {}
+
+# ── Global lock inspeksi dadakan via /unmutemic (hindari concurrent floodwait) ─
+_vc_inspection_lock: asyncio.Lock | None = None
+
+
+def get_vc_inspection_lock() -> asyncio.Lock:
+    """Return (atau buat) lock inspeksi dadakan. Aman dipanggil dari event loop manapun."""
+    global _vc_inspection_lock
+    if _vc_inspection_lock is None:
+        _vc_inspection_lock = asyncio.Lock()
+    return _vc_inspection_lock
 
 # ── Pelacak keberadaan userbot di VC per grup ─────────────────────────────────
 # Di-set saat join berhasil, dihapus saat leave/disabled.
@@ -108,7 +129,13 @@ _ub_in_vc_groups: set[int] = set()   # {chat_id}
 # Mencegah multi-join cepat dari jalur manapun (UpdateGroupCall, OnJoin, keepalive).
 # Value: waktu monotonic saat join terakhir.
 _vc_join_last_ts: dict[int, float] = {}   # {chat_id: monotonic_time}
-_VC_JOIN_COOLDOWN = 15.0  # detik — minimal jeda antar join ke VC yang sama
+_VC_JOIN_COOLDOWN      = 15.0      # detik — minimal jeda antar join ke VC yang sama
+_VC_SCHEDULED_INTERVAL = 30 * 60   # 30 menit — jeda antar siklus join per grup
+_VC_SCAN_DURATION      = 20        # detik stay di VC untuk scan peserta saat ini
+
+# ── Cache admin grup per chat_id (TTL 5 menit) ──────────────────────────────
+_admin_cache: dict[int, tuple[set[int], float]] = {}   # {chat_id: (admin_ids, ts)}
+_ADMIN_CACHE_TTL = 300.0   # 5 menit — refresh admin list tiap 5 menit
 
 # ── Cache bio per user per grup (dua lapis) ──────────────────────────────────
 # Lapisan 1 (di sini, video_call.py): cache in-memory userbot, TTL 60 detik.
@@ -168,6 +195,36 @@ def _get_warn_queue(chat_id: int) -> asyncio.Queue:
     if chat_id not in _warn_queues:
         _warn_queues[chat_id] = asyncio.Queue()
     return _warn_queues[chat_id]
+
+async def _get_group_admin_ids(chat_id: int) -> set[int]:
+    """
+    Ambil set user_id admin grup, dengan cache 5 menit.
+    Return set kosong jika error — lebih aman skip check daripada false-kick admin.
+    Dipanggil sebelum loop scan peserta VC untuk skip admin dari pengecekan.
+    """
+    cached = _admin_cache.get(chat_id)
+    if cached:
+        ids, ts = cached
+        if time.monotonic() - ts < _ADMIN_CACHE_TTL:
+            return ids
+    if not userbot:
+        return set()
+    try:
+        from pyrogram.enums import ChatMembersFilter
+        admin_ids: set[int] = set()
+        async for member in userbot.get_chat_members(chat_id, filter=ChatMembersFilter.ADMINISTRATORS):
+            if member.user and member.user.id:
+                admin_ids.add(member.user.id)
+        _admin_cache[chat_id] = (admin_ids, time.monotonic())
+        print(f"[UB-VC] Admin grup {chat_id}: {len(admin_ids)} admin di-cache.")
+        return admin_ids
+    except FloodWait as fw:
+        await asyncio.sleep(fw.value + 1)
+        return _admin_cache.get(chat_id, (set(), 0.0))[0]
+    except Exception as e:
+        print(f"[UB-VC] Gagal ambil admin grup {chat_id}: {e}")
+        return _admin_cache.get(chat_id, (set(), 0.0))[0]
+
 
 async def _warn_worker(chat_id: int) -> None:
     """
@@ -592,7 +649,6 @@ async def start_userbot(bot: _Client) -> None:
             await _save_ub_session()
             # Log berapa grup Security OS yang sudah terdaftar di DB
             await _log_registered_groups()
-            # Jalankan loop monitor voice chat di background
             asyncio.create_task(_voice_chat_monitor_loop())
             return
         except Exception as e:
@@ -700,7 +756,7 @@ async def _log_registered_groups() -> None:
             await asyncio.sleep(_STARTUP_STAGGER)
 
     print("[UB] ✅ Startup stagger selesai — userbot siap.")
-    # Join grup dilakukan di _auto_join_active_voice_chats (sequential per grup)
+    # Join grup dilakukan oleh _vc_scheduled_loop setiap 30 menit
 
 
 async def _voice_chat_monitor_loop() -> None:
@@ -832,26 +888,12 @@ async def _voice_chat_monitor_loop() -> None:
                         #
                         # UpdateGroupCall (event VC mulai) dikirim ke SEMUA member grup,
                         # sehingga inilah satu-satunya kesempatan reliable untuk join.
-                        if enabled and access_hash:
-                            # Skip jika userbot sudah di VC atau masih dalam cooldown —
-                            # UpdateGroupCall bisa muncul ulang saat userbot join/leave
-                            # tanpa ada VC baru yang benar-benar dimulai.
-                            _now_ts = time.monotonic()
-                            _already_in = chat_id_neg in _ub_in_vc_groups
-                            _in_cooldown = (_now_ts - _vc_join_last_ts.get(chat_id_neg, 0.0)) < _VC_JOIN_COOLDOWN
-                            if _already_in or _in_cooldown:
-                                print(
-                                    f"[UB-VC] UpdateGroupCall grup {chat_id_neg}: "
-                                    f"skip join ({'sudah di VC' if _already_in else 'cooldown'})"
-                                )
-                            else:
-                                print(
-                                    f"[UB-VC] VC baru dimulai di grup {chat_id_neg} "
-                                    f"(call_id={call_id}) — userbot join untuk mulai memantau"
-                                )
-                                asyncio.create_task(
-                                    _join_vc_runtime(chat_id_neg, call_id, access_hash)
-                                )
+                        # Scheduler 30 menit akan join pada waktunya — tidak auto-join di sini.
+                        if enabled:
+                            print(
+                                f"[UB-VC] VC dimulai di grup {chat_id_neg} "
+                                f"(call_id={call_id}) — dijadwal tiap 30 menit."
+                            )
             return
 
         if not isinstance(update, UpdateGroupCallParticipants):
@@ -880,29 +922,10 @@ async def _voice_chat_monitor_loop() -> None:
         # tapi userbot tidak perlu tahu monitor_bot_id untuk cek bio.
         monitor_id = sec_doc.get("monitor_bot_id", 0)  # dipertahankan untuk logging
 
-        # ── On-demand VC join: picu saat ada user (non-userbot) yang join ──────
-        # Logika: tiap ada user join VC → userbot join (jika belum) atau rejoin
-        # (jika sudah ada, untuk memperpanjang stay).
-        # Gunakan flag _any_user_joined agar hanya satu join dipicu per event,
-        # bukan satu per peserta jika ada banyak user join sekaligus.
-        _any_user_joined = False
-        for _p_check in update.participants:
-            if not isinstance(_p_check, GroupCallParticipant):
-                continue
-            if getattr(_p_check, "left", False):
-                continue
-            _peer_check = getattr(_p_check, "peer", None)
-            if _peer_check is None:
-                continue
-            _uid_check = getattr(_peer_check, "user_id", None)
-            if _uid_check and _uid_check != _ub_self_id:
-                _any_user_joined = True
-                break
+        # Tidak ada auto-join — scheduler 30 menit yang menangani join VC.
 
-        if _any_user_joined:
-            asyncio.create_task(
-                _trigger_vc_join_on_user_join(chat_id, call_id)
-            )
+        # FIX 4: Ambil daftar admin grup (cached 5 menit) — admin di-skip
+        _vc_admin_ids = await _get_group_admin_ids(chat_id)
 
         for p in update.participants:
             if not isinstance(p, GroupCallParticipant):
@@ -917,47 +940,62 @@ async def _voice_chat_monitor_loop() -> None:
             uid = getattr(peer, "user_id", None)
             if not uid or uid == _ub_self_id:
                 continue
+            # FIX 4: Skip admin grup
+            if uid in _vc_admin_ids:
+                continue
 
-            # Ambil status muted dari update ini.
-            # GroupCallParticipant.muted = True jika mic sedang di-mute oleh admin.
-            # Digunakan untuk:
-            #   1. Mute ulang (skip notif jika sudah muted sebelumnya)
-            #   2. Unmute jika bio bersih (hanya jika userbot yang mute-kan)
-            is_muted = bool(getattr(p, "muted", False))
+            # Pisahkan "muted mic oleh admin" vs "mute sendiri" vs "muted di typing (chat)"
+            # muted=True + can_self_unmute=False → admin mute mic (yang userbot pedulikan)
+            # muted=True + can_self_unmute=True  → self-mute (BUKAN urusan userbot)
+            # Restrict typing (chat ban) TIDAK ada kaitannya dengan field VC ini.
+            _p_muted    = bool(getattr(p, "muted", False))
+            _can_self   = bool(getattr(p, "can_self_unmute", True))
+            is_muted    = _p_muted and not _can_self   # True hanya jika admin-muted
+            # BUG 2: muted_by_you = field Telegram API, True jika userbot sendiri yang mute
+            muted_by_you = bool(getattr(p, "muted_by_you", False))
 
             key = (chat_id, uid)
             if key in _processing_kick:
                 continue
 
-            # Cek in-memory cache dulu (TTL 10 menit)
+            # Cek in-memory cache dulu (TTL 1 menit)
             cached = _bio_cache.get(key)
             if cached:
                 has_link, cache_ts = cached
                 if time.monotonic() - cache_ts < _BIO_CACHE_TTL:
                     if has_link:
+                        # Jika admin lain sudah unmute (is_muted=False) tapi
+                        # bio masih ada link → mute ulang dengan notifikasi baru.
                         _processing_kick.add(key)
-                        # BUG FIX: Bangun InputGroupCall dengan access_hash yang valid.
-                        # update.call adalah GroupCallReference (hanya punya .id),
-                        # phone.EditGroupCallParticipant butuh InputGroupCall (.id + .access_hash).
                         call_input = _build_input_group_call(call_id)
+                        if not is_muted:
+                            print(
+                                f"[UB-VC] uid={uid} grup={chat_id}: di-unmute admin lain "
+                                "tapi bio masih ada link → mute mic ulang."
+                            )
                         asyncio.create_task(
                             _execute_kick(chat_id, uid, call_input, was_already_muted=is_muted)
                         )
-                    # has_link=False dan user muted → minta bot pemantau cek ulang
                     elif is_muted:
+                        # bio bersih/kosong tapi mic muted → cek fresh dari bot pemantau
                         _processing_kick.add(key)
                         call_input = _build_input_group_call(call_id)
                         asyncio.create_task(
-                            _query_monitor_then_kick(chat_id, uid, monitor_id, call_input, is_muted=True)
+                            _query_monitor_then_kick(
+                                chat_id, uid, monitor_id, call_input,
+                                is_muted=True, muted_by_you=muted_by_you,
+                            )
                         )
                     continue
 
             # Query DB (bot pemantau sudah mengisi bio_profiles)
-            # Teruskan is_muted agar bisa unmute jika bio bersih
             _processing_kick.add(key)
             call_input = _build_input_group_call(call_id)
             asyncio.create_task(
-                _query_monitor_then_kick(chat_id, uid, monitor_id, call_input, is_muted=is_muted)
+                _query_monitor_then_kick(
+                    chat_id, uid, monitor_id, call_input,
+                    is_muted=is_muted, muted_by_you=muted_by_you,
+                )
             )
 
     # Warmup: isi _call_id_to_chat dari grup Security OS yang sudah punya VC aktif
@@ -970,13 +1008,8 @@ async def _voice_chat_monitor_loop() -> None:
     # berada di dalam VC. Jika VC sudah aktif sebelum bot start (dan tidak ada
     # UpdateGroupCall baru yang diterima), userbot tidak akan pernah masuk VC
     # kecuali join manual di sini.
-    asyncio.create_task(_auto_join_active_voice_chats())
-    print("[UB-VC] Auto-join VC aktif dijadwalkan (startup).")
-
-    # BUG FIX: keepalive rejoin jika dikick + heartbeat cegah kick diam-diam
-    asyncio.create_task(_vc_keepalive_loop())
-    asyncio.create_task(_vc_heartbeat_loop())
-    print("[UB-VC] Keepalive + heartbeat loop dijadwalkan.")
+    asyncio.create_task(_vc_scheduled_loop())
+    print("[UB-VC] Scheduler join VC 30 menit dimulai.")
 
     # Jaga task tetap hidup
     while _ub_ready and userbot:
@@ -985,192 +1018,226 @@ async def _voice_chat_monitor_loop() -> None:
 
 
 
-
-async def _vc_keepalive_loop() -> None:
+async def _vc_join_raw(chat_id: int, call_id: int, access_hash: int) -> bool:
     """
-    Keepalive loop — jalankan tiap _VC_KEEPALIVE_INTERVAL detik.
-
-    Telegram bisa mengeluarkan peserta VC yang muted+idle secara diam-diam
-    tanpa mengirim event apapun ke userbot. Fungsi ini cek secara berkala
-    apakah userbot masih terdaftar sebagai peserta VC di setiap grup
-    Security OS aktif, dan rejoin jika sudah dikeluarkan.
-
-    Interval: 60 detik (cek tiap 1 menit agar tidak ada jeda lama).
+    Join VC via raw MTProto pyrogram.
+    Telegram akan kick userbot setelah ~30 detik — tidak masalah, tugasnya sudah selesai.
+    Return True jika berhasil (atau sudah ada di VC), False jika gagal.
     """
-    await asyncio.sleep(20)   # beri waktu startup selesai dulu
-
+    if not userbot:
+        return False
+    import random as _random
+    import json as _json
     from pyrogram.raw import functions as _rf
     from pyrogram.raw.types import InputGroupCall, DataJSON
-    import json
-    import random as _random
+
+    ssrc  = _random.randint(1, 0xFFFFFFFF)
+    ufrag = "".join(_random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=8))
+    pwd   = "".join(_random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=22))
+    params = DataJSON(data=_json.dumps({
+        "ufrag": ufrag,
+        "pwd":   pwd,
+        "fingerprints": [],
+        "ssrc": ssrc,
+    }))
+    input_call = InputGroupCall(id=call_id, access_hash=access_hash)
+    try:
+        await userbot.invoke(
+            _rf.phone.JoinGroupCall(
+                call=input_call,
+                join_as=await userbot.resolve_peer("me"),
+                params=params,
+                muted=True,
+                video_stopped=True,
+            )
+        )
+        print(f"[UB-VC-Join] ✅ Join VC grup {chat_id} berhasil (raw MTProto, ssrc={ssrc})")
+        return True
+    except FloodWait as fw:
+        print(f"[UB-VC-Join] FloodWait {fw.value}s saat join VC grup {chat_id}")
+        await asyncio.sleep(fw.value + 1)
+        return False
+    except Exception as e:
+        err_str = str(e).lower()
+        if "already" in err_str:
+            return True   # Sudah di VC — anggap berhasil
+        print(f"[UB-VC-Join] Gagal join VC grup {chat_id}: {e}")
+        return False
+
+
+async def _vc_get_call_info(chat_id: int):
+    """
+    Ambil (call_id, access_hash) dari GetFullChannel.
+    Return (call_id, access_hash) atau (None, None) jika tidak ada VC aktif.
+    """
+    if not userbot:
+        return None, None
+    from pyrogram.raw import functions as _rf
+    try:
+        chat_peer = await userbot.resolve_peer(chat_id)
+        full = await userbot.invoke(_rf.channels.GetFullChannel(channel=chat_peer))
+        call_obj = getattr(full.full_chat, "call", None)
+        if not call_obj:
+            return None, None
+        call_id     = call_obj.id
+        access_hash = getattr(call_obj, "access_hash", None)
+        if access_hash:
+            _call_id_to_chat[call_id]        = chat_id
+            _call_id_to_access_hash[call_id] = access_hash
+        return call_id, access_hash
+    except FloodWait as fw:
+        print(f"[UB-VC] FloodWait {fw.value}s saat GetFullChannel grup {chat_id}")
+        await asyncio.sleep(fw.value + 1)
+        return None, None
+    except Exception as e:
+        print(f"[UB-VC] Gagal GetFullChannel grup {chat_id}: {e}")
+        return None, None
+
+
+async def _vc_scan_and_enforce(chat_id: int) -> None:
+    """
+    Satu siklus Security OS untuk satu grup:
+      1. Ambil info VC aktif (GetFullChannel)
+      2. Join VC via raw MTProto
+      3. Ambil semua peserta VC via GetGroupParticipants
+      4. Cek bio tiap peserta (cache 1 menit) → mute jika link, unmute jika bersih
+      5. Tunggu _VC_SCAN_DURATION detik (sambil handle user baru yg join via UpdateGroupCallParticipants)
+      6. Leave VC (Telegram mungkin sudah kick duluan — tidak masalah)
+
+    Semua langkah diproteksi FloodWait. Antar grup ada stagger 10 detik di scheduler.
+    """
+    if not userbot or not _ub_ready:
+        return
+
+    sec_doc = await _sec_os_get(chat_id)
+    if not sec_doc.get("enabled"):
+        return
+    monitor_id = sec_doc.get("monitor_bot_id", 0)
+
+    print(f"[UB-VC-Sched] Grup {chat_id}: mulai siklus scan VC...")
+
+    # ── 1. Ambil info VC aktif ───────────────────────────────────────────────
+    call_id, access_hash = await _vc_get_call_info(chat_id)
+    if not call_id or not access_hash:
+        print(f"[UB-VC-Sched] Grup {chat_id}: tidak ada VC aktif — skip siklus ini.")
+        return
+
+    # ── 2. Join VC ───────────────────────────────────────────────────────────
+    ok = await _vc_join_raw(chat_id, call_id, access_hash)
+    if not ok:
+        print(f"[UB-VC-Sched] Grup {chat_id}: gagal join VC — skip siklus ini.")
+        return
+
+    _ub_in_vc_groups.add(chat_id)
+    _vc_join_last_ts[chat_id] = time.monotonic()
+
+    # ── 3. Scan peserta saat ini via GetGroupParticipants ────────────────────
+    from pyrogram.raw import functions as _rf
+    from pyrogram.raw.types import InputGroupCall
+    input_call = InputGroupCall(id=call_id, access_hash=access_hash)
+    try:
+        result = await userbot.invoke(
+            _rf.phone.GetGroupParticipants(
+                call=input_call,
+                ids=[],
+                sources=[],
+                offset="",
+                limit=200,
+            )
+        )
+        participants = getattr(result, "participants", [])
+        print(f"[UB-VC-Sched] Grup {chat_id}: {len(participants)} peserta ditemukan di VC.")
+
+        # Ambil daftar admin grup — admin di-skip, tidak di-mute oleh userbot
+        admin_ids = await _get_group_admin_ids(chat_id)
+
+        for p in participants:
+            peer = getattr(p, "peer", None)
+            if peer is None:
+                continue
+            uid = getattr(peer, "user_id", None)
+            if not uid or uid == _ub_self_id:
+                continue
+            # FIX 4: Skip admin grup — userbot tidak memeriksa atau mute admin
+            if uid in admin_ids:
+                continue
+            # Hanya admin-muted yang dihitung — bukan self-muted atau chat restriction (typing ban)
+            _pm  = bool(getattr(p, "muted", False))
+            _cs  = bool(getattr(p, "can_self_unmute", True))
+            is_muted     = _pm and not _cs       # True hanya jika mic di-mute oleh admin
+            # BUG 2: field Telegram API — True jika userbot sendiri yang mute mic user ini
+            muted_by_you = bool(getattr(p, "muted_by_you", False))
+            key = (chat_id, uid)
+            if key in _processing_kick:
+                continue
+            _processing_kick.add(key)
+            call_input = _build_input_group_call(call_id)
+            asyncio.create_task(
+                _query_monitor_then_kick(
+                    chat_id, uid, monitor_id, call_input,
+                    is_muted=is_muted, muted_by_you=muted_by_you,
+                )
+            )
+    except FloodWait as fw:
+        print(f"[UB-VC-Sched] FloodWait {fw.value}s saat GetGroupParticipants grup {chat_id}")
+        await asyncio.sleep(fw.value + 1)
+    except Exception as e:
+        print(f"[UB-VC-Sched] Gagal GetGroupParticipants grup {chat_id}: {e}")
+
+    # ── 4. Tunggu sambil handle user baru yang join via UpdateGroupCallParticipants ─
+    # Handler _on_vc_update sudah aktif — user baru yang join selama window ini
+    # akan otomatis dicek oleh handler tersebut (karena chat_id in _ub_in_vc_groups).
+    await asyncio.sleep(_VC_SCAN_DURATION)
+
+    # ── 5. Leave VC (Telegram mungkin sudah kick duluan) ────────────────────
+    _ub_in_vc_groups.discard(chat_id)
+    print(f"[UB-VC-Sched] Grup {chat_id}: siklus selesai, keluar dari VC.")
+    try:
+        await userbot.invoke(_rf.phone.LeaveGroupCall(call=input_call, source=0))
+    except Exception:
+        pass   # Sudah dikick atau tidak di VC — tidak masalah
+
+
+async def _vc_scheduled_loop() -> None:
+    """
+    Scheduler utama Security OS:
+    Setiap _VC_SCHEDULED_INTERVAL (30 menit), untuk tiap grup yang Security OS-nya aktif
+    → jalankan satu siklus _vc_scan_and_enforce.
+
+    Stagger antar grup: 10 detik jeda untuk cegah FloodWait ke Telegram API.
+    Siklus pertama dimulai 60 detik setelah startup (beri waktu warmup selesai).
+    """
+    print("[UB-VC-Sched] ⏰ Scheduler join VC 30 menit aktif.")
+    await asyncio.sleep(60)   # beri waktu startup/warmup selesai
 
     while _ub_ready and userbot:
-        await asyncio.sleep(_VC_KEEPALIVE_INTERVAL)
-
-        if not userbot or not _ub_ready:
-            break
-
         db, _, _ = _get_db()
         try:
             docs = await db["security_os"].find({"enabled": True}).to_list(None)
         except Exception:
+            await asyncio.sleep(60)
             continue
 
-        for doc in docs:
-            chat_id = doc.get("chat_id")
-            if not chat_id or not userbot or not _ub_ready:
-                continue
-            try:
-                # Ambil info VC aktif di grup ini
-                chat_peer = await userbot.resolve_peer(chat_id)
-                full = await userbot.invoke(_rf.channels.GetFullChannel(channel=chat_peer))
-                call_obj = getattr(full.full_chat, "call", None)
-                if not call_obj:
-                    continue   # Tidak ada VC aktif — tidak perlu cek
-
-                call_id     = call_obj.id
-                access_hash = getattr(call_obj, "access_hash", None)
-                if not access_hash:
-                    continue
-
-                # Update mapping agar event VC tetap dikenali
-                _call_id_to_chat[call_id]        = chat_id
-                _call_id_to_access_hash[call_id] = access_hash
-
-                # Cek apakah userbot masih terdaftar sebagai peserta VC
-                input_call = InputGroupCall(id=call_id, access_hash=access_hash)
-                result = await userbot.invoke(
-                    _rf.phone.GetGroupParticipants(
-                        call=input_call,
-                        ids=[await userbot.resolve_peer("me")],
-                        sources=[],
-                        offset="",
-                        limit=1,
-                    )
-                )
-                participants = getattr(result, "participants", [])
-                still_in_vc = len(participants) > 0
-
-                if still_in_vc:
-                    continue   # Masih di VC — tidak perlu rejoin
-
-                # Tidak ada di VC → rejoin
-                print(
-                    f"[UB-VC-Keepalive] Grup {chat_id}: userbot tidak lagi di VC "
-                    f"(mungkin di-kick Telegram) — rejoin..."
-                )
-                ssrc  = _random.randint(1, 0xFFFFFFFF)
-                ufrag = "".join(_random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=8))
-                params = DataJSON(data=json.dumps({
-                    "ufrag": ufrag,
-                    "pwd":   "".join(_random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=22)),
-                    "fingerprints": [],
-                    "ssrc": ssrc,
-                }))
-                await userbot.invoke(
-                    _rf.phone.JoinGroupCall(
-                        call=input_call,
-                        join_as=await userbot.resolve_peer("me"),
-                        params=params,
-                        muted=True,
-                        video_stopped=True,
-                    )
-                )
-                _ub_in_vc_groups.add(chat_id)
-                _vc_join_last_ts[chat_id] = time.monotonic()
-                print(
-                    f"[UB-VC-Keepalive] ✅ Rejoin VC grup {chat_id} berhasil (ssrc={ssrc})."
-                )
-
-            except FloodWait as fw:
-                print(f"[UB-VC-Keepalive] FloodWait {fw.value}s grup {chat_id} — skip siklus ini.")
-                await asyncio.sleep(fw.value + 1)
-            except Exception as e:
-                err_str = str(e).lower()
-                if "already" in err_str:
-                    pass   # Sudah di VC — tidak perlu rejoin
-                else:
-                    print(f"[UB-VC-Keepalive] Grup {chat_id}: {e}")
-
-            await asyncio.sleep(2)   # jeda antar grup cegah FloodWait
-
-
-async def _vc_heartbeat_loop() -> None:
-    """
-    Heartbeat loop — kirim phone.EditGroupCallParticipant(muted=True) pada diri
-    sendiri setiap _VC_HEARTBEAT_INTERVAL detik untuk semua grup di _ub_in_vc_groups.
-
-    MENGAPA INI WAJIB:
-    Telegram media server menendang peserta VC yang bergabung via raw MTProto
-    (phone.JoinGroupCall dengan DataJSON) setelah ~30 detik jika tidak ada
-    sinyal aktivitas apapun. EditGroupCallParticipant adalah sinyal MTProto
-    yang memberitahu server bahwa klien masih aktif di dalam VC.
-
-    Jika heartbeat ini gagal dan userbot sudah dikick (NOT_IN_CALL), state
-    _ub_in_vc_groups di-reset agar _vc_keepalive_loop bisa rejoin.
-    """
-    await asyncio.sleep(15)  # beri waktu startup selesai dulu
-
-    from pyrogram.raw import functions as _rf_hb
-    from pyrogram.raw.types import InputGroupCall as _InputGroupCall_hb
-
-    while _ub_ready and userbot:
-        await asyncio.sleep(_VC_HEARTBEAT_INTERVAL)
-
-        if not userbot or not _ub_ready:
-            break
-
-        # Snapshot set agar tidak error jika berubah saat iterasi
-        groups_snapshot = set(_ub_in_vc_groups)
-        if not groups_snapshot:
-            continue
-
-        for chat_id in groups_snapshot:
-            if not userbot or not _ub_ready:
-                break
-
-            # Temukan call_id untuk grup ini dari mapping terbalik
-            call_id = None
-            for cid, chid in list(_call_id_to_chat.items()):
-                if chid == chat_id:
-                    call_id = cid
+        if docs:
+            print(f"[UB-VC-Sched] Mulai siklus — {len(docs)} grup aktif.")
+            for i, doc in enumerate(docs):
+                if not userbot or not _ub_ready:
                     break
-            if not call_id:
-                continue
+                chat_id = doc.get("chat_id")
+                if not chat_id:
+                    continue
+                if i > 0:
+                    await asyncio.sleep(10)   # stagger antar grup
+                asyncio.create_task(_vc_scan_and_enforce(chat_id))
+        else:
+            print("[UB-VC-Sched] Tidak ada grup aktif — tidur 60 detik.")
+            await asyncio.sleep(60)
+            continue
 
-            access_hash = _call_id_to_access_hash.get(call_id)
-            if not access_hash:
-                continue
+        print(f"[UB-VC-Sched] Tidur {_VC_SCHEDULED_INTERVAL // 60} menit hingga siklus berikutnya...")
+        await asyncio.sleep(_VC_SCHEDULED_INTERVAL)
 
-            try:
-                input_call = _InputGroupCall_hb(id=call_id, access_hash=access_hash)
-                self_peer  = await userbot.resolve_peer("me")
-                await userbot.invoke(
-                    _rf_hb.phone.EditGroupCallParticipant(
-                        call=input_call,
-                        participant=self_peer,
-                        muted=True,
-                    )
-                )
-                # Heartbeat berhasil — tidak perlu log tiap kali agar tidak spam
-            except FloodWait as fw:
-                await asyncio.sleep(fw.value + 1)
-            except Exception as e:
-                err_str = str(e).lower()
-                if "not_in_call" in err_str or "not in call" in err_str:
-                    # Userbot sudah dikick — reset state, biarkan keepalive rejoin
-                    _ub_in_vc_groups.discard(chat_id)
-                    print(
-                        f"[UB-VC-Heartbeat] Grup {chat_id}: userbot dikick dari VC "
-                        f"— state di-reset, keepalive akan rejoin."
-                    )
-                elif "not_modified" in err_str or "group_call_not_modified" in err_str:
-                    pass  # Tidak ada perubahan state — normal, abaikan
-                else:
-                    # Error lain tidak fatal
-                    pass
 
-            await asyncio.sleep(1)  # jeda kecil antar grup
 
 async def _resolve_chat_for_call_id(call_id: int) -> int | None:
     """
@@ -1257,252 +1324,6 @@ async def _warmup_active_calls() -> None:
         await asyncio.sleep(2)
 
 
-# ── Jeda antar join VC saat startup (cegah FloodWait) ────────────────────────
-_VC_JOIN_STARTUP_STAGGER = 5.0   # detik jeda antar join VC per grup
-
-
-async def _auto_join_active_voice_chats() -> None:
-    """
-    Saat startup/redeploy, userbot otomatis join ke semua obrolan suara
-    yang sedang aktif di grup-grup yang Security OS-nya enabled.
-
-    ── KENAPA PERLU JOIN VC ────────────────────────────────────────────────
-    Meskipun UpdateGroupCallParticipants diterima tanpa join VC,
-    phone.EditGroupCallParticipant (mute mic) HANYA bisa dipanggil oleh
-    peserta aktif VC ATAU admin dengan izin 'Kelola Obrolan Video'.
-    Jika userbot adalah admin dengan izin tersebut, join VC tidak wajib —
-    tapi jika gagal mute (error GROUP_CALL_NOT_MODIFIED atau serupa),
-    join VC sebagai fallback memastikan mute tetap berhasil.
-
-    ── KEAMANAN FLOODWAIT ──────────────────────────────────────────────────
-    • Join dilakukan satu per satu dengan jeda _VC_JOIN_STARTUP_STAGGER detik.
-    • FloodWait ditangkap dan ditunggu sebelum lanjut ke grup berikutnya.
-    • Userbot join sebagai muted (tidak bicara) agar tidak mengganggu VC.
-
-    ── RETRY OTOMATIS SAAT GAGAL ───────────────────────────────────────────
-    Jika join VC gagal (bukan karena "sudah ada"), userbot akan mencoba ulang
-    setelah _VC_JOIN_RETRY_SECS detik, maksimal _VC_JOIN_MAX_RETRIES kali.
-    Ini menangani kasus:
-      • Userbot belum sepenuhnya terdaftar sebagai member saat startup.
-      • Jaringan sesaat tidak stabil saat pertama kali join.
-      • VC baru dimulai saat startup stagger berjalan.
-
-    ── KAPAN DIPANGGIL ─────────────────────────────────────────────────────
-    Dipanggil dari start_userbot() SETELAH _warmup_active_calls() selesai,
-    sehingga _call_id_to_chat sudah terisi dan join bisa langsung terjadi.
-    """
-    if not userbot:
-        return
-    db, _, _ = _get_db()
-    try:
-        docs = await db["security_os"].find({"enabled": True}).to_list(None)
-    except Exception:
-        return
-
-    if not docs:
-        return
-
-    from pyrogram.raw import functions as _rf
-    from pyrogram.raw.types import InputGroupCall, DataJSON
-
-    joined_count = 0
-    for doc in docs:
-        chat_id = doc.get("chat_id")
-        if not chat_id:
-            continue
-
-        # ── Coba join dengan retry ────────────────────────────────────────
-        for attempt in range(1, _VC_JOIN_MAX_RETRIES + 1):
-            if not userbot or not _ub_ready:
-                break  # Userbot dihentikan saat loop
-
-            try:
-                chat_peer = await userbot.resolve_peer(chat_id)
-                full = await userbot.invoke(_rf.channels.GetFullChannel(channel=chat_peer))
-                call_obj = getattr(full.full_chat, "call", None)
-                if not call_obj:
-                    # Tidak ada VC aktif — tidak perlu retry
-                    break
-
-                call_id = call_obj.id
-                ah      = getattr(call_obj, "access_hash", None)
-                if not ah:
-                    print(f"[UB-VC-Join] Grup {chat_id}: access_hash tidak tersedia — skip join")
-                    break
-
-                input_call = InputGroupCall(id=call_id, access_hash=ah)
-
-                # SSRC harus unik per sesi — generate random 32-bit unsigned int.
-                # Hardcode ssrc=0 menyebabkan GROUPCALL_SSRC_DUPLICATE_MUCH jika
-                # sesi lain (atau percobaan sebelumnya) sudah mendaftarkan ssrc=0.
-                import json, random as _random
-                ssrc = _random.randint(1, 0xFFFFFFFF)
-                ufrag = "".join(_random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=8))
-                params = DataJSON(data=json.dumps({
-                    "ufrag": ufrag,
-                    "pwd":   "".join(_random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=22)),
-                    "fingerprints": [],
-                    "ssrc": ssrc,
-                }))
-                await userbot.invoke(
-                    _rf.phone.JoinGroupCall(
-                        call=input_call,
-                        join_as=await userbot.resolve_peer("me"),
-                        params=params,
-                        muted=True,
-                        video_stopped=True,
-                    )
-                )
-                joined_count += 1
-                _ub_in_vc_groups.add(chat_id)
-                _vc_join_last_ts[chat_id] = time.monotonic()
-                print(f"[UB-VC-Join] ✅ Userbot join VC grup {chat_id} (call_id={call_id}, ssrc={ssrc}) sebagai muted")
-                break   # Berhasil — keluar dari loop retry
-
-            except FloodWait as fw:
-                print(f"[UB-VC-Join] FloodWait {fw.value}s saat join VC grup {chat_id} — menunggu...")
-                await asyncio.sleep(fw.value + 1)
-                # FloodWait — tunggu, lalu retry (jangan hitung sebagai attempt gagal)
-                continue
-
-            except Exception as e:
-                err_str = str(e).lower()
-                if "already" in err_str:
-                    print(f"[UB-VC-Join] Grup {chat_id}: userbot sudah ada di VC")
-                    break
-                elif (
-                    "peer_id_invalid" in err_str
-                    or "peer id invalid" in err_str
-                    or "not_participant" in err_str
-                    or isinstance(e, (PeerIdInvalid, ValueError, KeyError))
-                ):
-                    # Peer belum dikenal sesi userbot — tidak ada gunanya retry
-                    print(f"[UB-VC-Join] Grup {chat_id}: peer tidak dikenal — skip, tidak retry.")
-                    break
-                elif "ssrc_duplicate" in err_str:
-                    # SSRC bentrok — SSRC sudah di-randomize ulang tiap loop,
-                    # retry langsung tanpa jeda karena nilai baru sudah berbeda.
-                    print(
-                        f"[UB-VC-Join] Grup {chat_id}: SSRC duplicate (attempt {attempt}) "
-                        "— retry dengan SSRC baru..."
-                    )
-                    # Jangan sleep — langsung retry loop berikutnya dengan SSRC random baru
-                    continue
-                else:
-                    # Error lain — coba lagi setelah jeda
-                    print(
-                        f"[UB-VC-Join] Grup {chat_id}: gagal join VC "
-                        f"(attempt {attempt}/{_VC_JOIN_MAX_RETRIES}) — {e}"
-                    )
-                    if attempt < _VC_JOIN_MAX_RETRIES:
-                        print(
-                            f"[UB-VC-Join] Grup {chat_id}: retry dalam "
-                            f"{_VC_JOIN_RETRY_SECS:.0f} detik..."
-                        )
-                        await asyncio.sleep(_VC_JOIN_RETRY_SECS)
-                    else:
-                        print(
-                            f"[UB-VC-Join] Grup {chat_id}: semua {_VC_JOIN_MAX_RETRIES} "
-                            "percobaan gagal — lewati."
-                        )
-
-        # Jeda antar grup untuk cegah FloodWait lintas grup
-        await asyncio.sleep(_VC_JOIN_STARTUP_STAGGER)
-
-    if joined_count > 0:
-        print(f"[UB-VC-Join] ✅ Selesai — userbot join {joined_count} VC aktif saat startup.")
-    else:
-        print("[UB-VC-Join] Tidak ada VC aktif yang perlu di-join saat startup.")
-
-
-async def _join_vc_runtime(chat_id: int, call_id: int, access_hash: int) -> None:
-    """
-    Auto-join VC yang baru dimulai di runtime (bukan saat startup).
-    Dipanggil dari handler UpdateGroupCall saat VC baru dimulai.
-
-    ── RETRY ──────────────────────────────────────────────────────────────
-    Mencoba join maksimal 3 kali dengan jeda 10 detik antar percobaan.
-    Ini menangani race condition di mana VC baru dimulai tapi Telegram
-    belum sepenuhnya siap menerima JoinGroupCall.
-
-    Userbot join sebagai muted (tidak bicara) agar tidak mengganggu VC.
-    """
-    if not userbot or not _ub_ready:
-        return
-
-    from pyrogram.raw import functions as _rf
-    from pyrogram.raw.types import InputGroupCall, DataJSON
-    import json
-
-    _MAX_RETRIES  = 3
-    _RETRY_SECS   = 10.0
-
-    # Jeda kecil saat VC baru dimulai — beri waktu Telegram memproses
-    await asyncio.sleep(2.0)
-
-    for attempt in range(1, _MAX_RETRIES + 1):
-        if not userbot or not _ub_ready:
-            return
-        try:
-            input_call = InputGroupCall(id=call_id, access_hash=access_hash)
-            # SSRC random unik per percobaan — cegah GROUPCALL_SSRC_DUPLICATE_MUCH
-            import random as _random
-            ssrc  = _random.randint(1, 0xFFFFFFFF)
-            ufrag = "".join(_random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=8))
-            params = DataJSON(data=json.dumps({
-                "ufrag": ufrag,
-                "pwd":   "".join(_random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=22)),
-                "fingerprints": [],
-                "ssrc": ssrc,
-            }))
-            await userbot.invoke(
-                _rf.phone.JoinGroupCall(
-                    call=input_call,
-                    join_as=await userbot.resolve_peer("me"),
-                    params=params,
-                    muted=True,
-                    video_stopped=True,
-                )
-            )
-            _ub_in_vc_groups.add(chat_id)
-            _vc_join_last_ts[chat_id] = time.monotonic()
-            print(
-                f"[UB-VC-Join] ✅ Runtime join VC grup {chat_id} "
-                f"(call_id={call_id}, ssrc={ssrc}, attempt={attempt})"
-            )
-            return   # Berhasil
-
-        except FloodWait as fw:
-            print(f"[UB-VC-Join] FloodWait {fw.value}s saat runtime join VC grup {chat_id}")
-            await asyncio.sleep(fw.value + 1)
-            continue
-
-        except Exception as e:
-            err_str = str(e).lower()
-            if "already" in err_str:
-                print(f"[UB-VC-Join] Runtime join grup {chat_id}: userbot sudah ada di VC")
-                return
-            elif "ssrc_duplicate" in err_str:
-                # SSRC bentrok — retry langsung dengan SSRC random baru
-                print(
-                    f"[UB-VC-Join] Runtime join grup {chat_id}: SSRC duplicate "
-                    f"(attempt {attempt}) — retry dengan SSRC baru..."
-                )
-                continue
-            else:
-                print(
-                    f"[UB-VC-Join] Runtime join grup {chat_id} gagal "
-                    f"(attempt {attempt}/{_MAX_RETRIES}): {e}"
-                )
-                if attempt < _MAX_RETRIES:
-                    await asyncio.sleep(_RETRY_SECS)
-                else:
-                    print(
-                        f"[UB-VC-Join] Grup {chat_id}: semua {_MAX_RETRIES} "
-                        "percobaan runtime join gagal."
-                    )
-
-
 async def _leave_vc_for_group(chat_id: int) -> None:
     """
     Paksa userbot keluar dari obrolan suara grup ini.
@@ -1532,10 +1353,26 @@ async def _leave_vc_for_group(chat_id: int) -> None:
             print(f"[UB-VC-Leave] Grup {chat_id}: access_hash tidak tersedia — skip leave.")
             return
 
-        input_call = InputGroupCall(id=call_id, access_hash=access_hash)
-        await userbot.invoke(
-            _rf.phone.LeaveGroupCall(call=input_call, source=0)
-        )
+        # Dapatkan call_id dari mapping
+        _lv_call_id = None
+        for _cid, _chid in list(_call_id_to_chat.items()):
+            if _chid == chat_id:
+                _lv_call_id = _cid
+                break
+        if _lv_call_id:
+            from pyrogram.raw import functions as _rf_lv
+            from pyrogram.raw.types import InputGroupCall as _IPC_lv
+            _lv_ah = _call_id_to_access_hash.get(_lv_call_id)
+            if _lv_ah:
+                try:
+                    await userbot.invoke(
+                        _rf_lv.phone.LeaveGroupCall(
+                            call=_IPC_lv(id=_lv_call_id, access_hash=_lv_ah),
+                            source=0,
+                        )
+                    )
+                except Exception:
+                    pass
         _ub_in_vc_groups.discard(chat_id)
         print(f"[UB-VC-Leave] ✅ Userbot keluar dari VC grup {chat_id} (Security OS dinonaktifkan).")
     except FloodWait as fw:
@@ -1549,212 +1386,16 @@ async def _leave_vc_for_group(chat_id: int) -> None:
             print(f"[UB-VC-Leave] Grup {chat_id}: error leave VC — {e}")
 
 
-async def _trigger_vc_join_on_user_join(chat_id: int, call_id: int) -> None:
-    """
-    Dipicu saat ada user join obrolan suara (dari UpdateGroupCallParticipants).
-
-    ── LOGIKA ─────────────────────────────────────────────────────────────────
-    • Jika userbot SUDAH ada di VC → TIDAK melakukan apapun.
-      Userbot cukup stay di VC — tidak perlu rejoin setiap ada user masuk.
-      Rejoin berulang menyebabkan storm UpdateGroupCallParticipants (feedback
-      loop) yang bisa mengganggu koneksi monitor bot dan menyebabkan siklus
-      leave/rejoin yang tidak diinginkan.
-    • Jika userbot BELUM ada di VC → join VC.
-    • Cooldown: jika join sudah dilakukan dalam _VC_JOIN_COOLDOWN detik terakhir
-      → skip untuk mencegah multi-join dari event yang tumpuk bersamaan.
-
-    Userbot join sebagai muted (tidak bicara) agar tidak mengganggu VC.
-    """
-    if not userbot or not _ub_ready:
-        return
-
-    # ── Jika userbot sudah di VC → tidak perlu join/rejoin ──────────────────
-    # Rejoin pada setiap user-join event menyebabkan feedback loop:
-    # JoinGroupCall → Telegram kirim UpdateGroupCallParticipants dengan semua
-    # peserta → handler trigger join lagi → storm → monitor bot terganggu.
-    if chat_id in _ub_in_vc_groups:
-        return   # sudah di VC — cukup stay, tidak perlu rejoin
-
-    # ── Cooldown: cegah multi-join cepat ────────────────────────────────────
-    now = time.monotonic()
-    last = _vc_join_last_ts.get(chat_id, 0.0)
-    if now - last < _VC_JOIN_COOLDOWN:
-        return   # masih dalam cooldown — skip
-
-    # Coba ambil access_hash dari cache, fallback ke GetFullChannel
-    access_hash = _call_id_to_access_hash.get(call_id)
-    if not access_hash:
-        try:
-            from pyrogram.raw import functions as _rf_fb
-            chat_peer_fb = await userbot.resolve_peer(chat_id)
-            full_fb      = await userbot.invoke(_rf_fb.channels.GetFullChannel(channel=chat_peer_fb))
-            call_obj_fb  = getattr(full_fb.full_chat, "call", None)
-            if call_obj_fb:
-                ah_fb = getattr(call_obj_fb, "access_hash", None)
-                if ah_fb:
-                    _call_id_to_access_hash[call_id] = ah_fb
-                    access_hash = ah_fb
-        except Exception:
-            pass
-
-    if not access_hash:
-        print(
-            f"[UB-VC-OnJoin] ⚠️  access_hash tidak tersedia untuk call_id={call_id} "
-            f"grup={chat_id} — skip join"
-        )
-        return
-
-    # Jeda 1 detik — agar tidak join di detik yang sama dengan event masuk
-    await asyncio.sleep(1.0)
-
-    if not userbot or not _ub_ready:
-        return
-
-    # Cek ulang setelah sleep: mungkin join sudah dilakukan dari jalur lain
-    if chat_id in _ub_in_vc_groups:
-        return
-    now2 = time.monotonic()
-    if now2 - _vc_join_last_ts.get(chat_id, 0.0) < _VC_JOIN_COOLDOWN:
-        return
-
-    from pyrogram.raw import functions as _rf
-    from pyrogram.raw.types import InputGroupCall, DataJSON
-    import json
-    import random as _random
-
-    input_call = InputGroupCall(id=call_id, access_hash=access_hash)
-
-    for _attempt in range(1, 4):   # maks 3 percobaan (untuk SSRC duplicate)
-        ssrc  = _random.randint(1, 0xFFFFFFFF)
-        ufrag = "".join(_random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=8))
-        params = DataJSON(data=json.dumps({
-            "ufrag": ufrag,
-            "pwd":   "".join(_random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=22)),
-            "fingerprints": [],
-            "ssrc":  ssrc,
-        }))
-        try:
-            await userbot.invoke(
-                _rf.phone.JoinGroupCall(
-                    call=input_call,
-                    join_as=await userbot.resolve_peer("me"),
-                    params=params,
-                    muted=True,
-                    video_stopped=True,
-                )
-            )
-            _ub_in_vc_groups.add(chat_id)
-            _vc_join_last_ts[chat_id] = time.monotonic()
-            print(
-                f"[UB-VC-OnJoin] ✅ join VC grup {chat_id} "
-                f"(call_id={call_id}, ssrc={ssrc}) — dipicu oleh user join"
-            )
-            return
-
-        except FloodWait as fw:
-            print(f"[UB-VC-OnJoin] FloodWait {fw.value}s saat join VC grup {chat_id}")
-            await asyncio.sleep(fw.value + 1)
-
-        except Exception as e:
-            err_str = str(e).lower()
-            if "already" in err_str:
-                _ub_in_vc_groups.add(chat_id)
-                print(f"[UB-VC-OnJoin] Grup {chat_id}: userbot sudah ada di VC")
-                return
-            elif "ssrc_duplicate" in err_str:
-                print(
-                    f"[UB-VC-OnJoin] Grup {chat_id}: SSRC duplicate "
-                    f"(attempt {_attempt}) — retry dengan SSRC baru..."
-                )
-                continue   # loop ulang dengan SSRC random baru
-            elif "not_in_call" in err_str or "not in call" in err_str:
-                # Rejoin gagal karena userbot sudah tidak di VC — reset state
-                _ub_in_vc_groups.discard(chat_id)
-                print(f"[UB-VC-OnJoin] Grup {chat_id}: userbot tidak di VC — state di-reset")
-                return
-            else:
-                print(f"[UB-VC-OnJoin] Gagal join VC grup {chat_id} (attempt {_attempt}): {e}")
-                return
-
-
 async def _join_vc_for_group(chat_id: int) -> None:
     """
-    Paksa userbot join obrolan suara grup ini sebagai muted.
-    Dipanggil saat Security OS diaktifkan admin.
-    Jika tidak ada VC aktif, fungsi ini selesai tanpa error.
-
-    Guard: skip jika userbot sudah di VC dan dalam cooldown 15 detik —
-    mencegah replace session yang menyebabkan brief leave+rejoin.
+    Dipanggil saat admin mengaktifkan Security OS.
+    Arsitektur baru: tidak join langsung — langsung jalankan satu siklus scan sekarang,
+    lalu scheduler 30 menit yang akan menangani siklus berikutnya.
     """
     if not userbot or not _ub_ready:
         return
-
-    # ── Guard: sudah di VC dan dalam cooldown? Skip ───────────────────────────
-    import time as _time_mod
-    _now = _time_mod.time()
-    if chat_id in _ub_in_vc_groups:
-        _last = _vc_join_last_ts.get(chat_id, 0.0)
-        if _now - _last < _VC_JOIN_COOLDOWN:
-            print(f"[UB-VC-Join] Grup {chat_id}: sudah di VC (cooldown aktif) — skip join ulang.")
-            return
-        # Sudah di VC tapi cooldown habis → tetap skip, keepalive yang urus
-        print(f"[UB-VC-Join] Grup {chat_id}: sudah di VC — skip, keepalive yang memantau.")
-        return
-
-    from pyrogram.raw import functions as _rf
-    from pyrogram.raw.types import InputGroupCall, DataJSON
-    import json
-    import random as _random
-
-    try:
-        chat_peer = await userbot.resolve_peer(chat_id)
-        full = await userbot.invoke(_rf.channels.GetFullChannel(channel=chat_peer))
-        call_obj = getattr(full.full_chat, "call", None)
-        if not call_obj:
-            print(f"[UB-VC-Join] Grup {chat_id}: Security OS aktif tapi tidak ada VC — userbot standby.")
-            return
-        call_id     = call_obj.id
-        access_hash = getattr(call_obj, "access_hash", None)
-        if not access_hash:
-            print(f"[UB-VC-Join] Grup {chat_id}: access_hash tidak tersedia — skip join.")
-            return
-
-        # Simpan ke mapping agar event VC langsung dikenali
-        _call_id_to_chat[call_id]        = chat_id
-        _call_id_to_access_hash[call_id] = access_hash
-
-        input_call = InputGroupCall(id=call_id, access_hash=access_hash)
-        ssrc  = _random.randint(1, 0xFFFFFFFF)
-        ufrag = "".join(_random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=8))
-        params = DataJSON(data=json.dumps({
-            "ufrag": ufrag,
-            "pwd":   "".join(_random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=22)),
-            "fingerprints": [],
-            "ssrc": ssrc,
-        }))
-        await userbot.invoke(
-            _rf.phone.JoinGroupCall(
-                call=input_call,
-                join_as=await userbot.resolve_peer("me"),
-                params=params,
-                muted=True,
-                video_stopped=True,
-            )
-        )
-        _ub_in_vc_groups.add(chat_id)
-        _vc_join_last_ts[chat_id] = _time_mod.time()
-        print(f"[UB-VC-Join] ✅ Userbot join VC grup {chat_id} (Security OS aktif, ssrc={ssrc}) sebagai muted.")
-    except FloodWait as fw:
-        print(f"[UB-VC-Join] FloodWait {fw.value}s saat join VC grup {chat_id}.")
-        await asyncio.sleep(fw.value + 1)
-    except Exception as e:
-        err_str = str(e).lower()
-        if "already" in err_str:
-            _ub_in_vc_groups.add(chat_id)
-            _vc_join_last_ts[chat_id] = _time_mod.time()
-            print(f"[UB-VC-Join] Grup {chat_id}: userbot sudah ada di VC — mark sebagai in-VC.")
-        else:
-            print(f"[UB-VC-Join] Grup {chat_id}: gagal join VC — {e}")
+    print(f"[UB-VC-Join] Security OS diaktifkan grup {chat_id} — jalankan siklus scan segera.")
+    asyncio.create_task(_vc_scan_and_enforce(chat_id))
 
 
 def _build_input_group_call(call_id: int):
@@ -1812,52 +1453,95 @@ async def _query_monitor_then_kick(
     monitor_bot_id: int,
     call_input,
     is_muted: bool = False,
+    muted_by_you: bool = False,
 ) -> None:
     """
-    Perintahkan bot pemantau cek bio user → mute jika ada link, unmute jika bersih.
+    Perintahkan bot pemantau cek bio user → mute mic jika ada link, unmute jika bersih.
 
-    ARSITEKTUR DB-DRIVEN:
+    ARSITEKTUR DB-DRIVEN (Security OS — BUKAN kick dari grup, hanya mute mic VC):
       Userbot memerintahkan bot pemantau (via force_check_vc_join) untuk
-      fetch bio fresh dari Telegram API saat user join VC.
+      fetch bio fresh dari Telegram API saat user naik ke voice chat.
       Hasilnya disimpan ke DB dan dikembalikan ke sini.
 
-    Alur:
-      has_link=True  → mute mic (via _execute_kick)
-      has_link=False → jika user sedang muted (is_muted=True) → unmute mic
-      has_link=None  → data tidak tersedia → tidak ada tindakan
+    Alur (Perubahan 1 — non-member):
+      non-member grup      → mute mic langsung, terlepas ada link atau tidak
+      has_link=True        → mute mic (via _execute_kick)
+      has_link=False       → jika admin-muted (is_muted=True) DAN userbot yang mute → unmute mic
+      has_link=None(kosong)→ dianggap tidak ada link → sama seperti False
 
-    Fallback aman: jika data tidak ada di DB → tidak kick.
+    Isolasi per grup: chat_id memastikan setiap grup hanya diperiksa
+    oleh bot pemantau grup tersebut. Data grup A tidak mencemari grup B.
+
+    BUG 2 FIX — Deteksi "siapa yang mute" dua lapis:
+      1. muted_by_you (bool dari Telegram API GroupCallParticipant.muted_by_you)
+         — field langsung dari Telegram, paling andal, tapi hanya ada saat scan/event
+      2. _ub_muted_this_user (DB collection vc_muted_by_ub)
+         — persisten antar siklus, backup jika field Telegram tidak tersedia
+      Unmute dibolehkan jika SALAH SATU dari keduanya True.
+      Jika admin lain yang mute (muted_by_you=False AND DB miss) → tidak di-unmute.
     """
     try:
+        # ── Perubahan 1: Non-member → mute mic langsung tanpa cek bio ────────
+        # User yang bukan anggota grup tidak boleh di obrolan suara grup.
+        # Mute dilakukan terlepas ada/tidaknya link di bio, lalu dicatat di DB.
+        is_member = await _is_group_member(chat_id, user_id)
+        if is_member is False:
+            reason_nm = "non-member grup naik ke obrolan suara"
+            print(
+                f"[UB-VC] uid={user_id} grup={chat_id}: "
+                f"non-member → mute mic langsung (tanpa cek bio)."
+            )
+            # Invalidasi cache member agar dicek ulang jika kondisi berubah
+            _member_cache.pop((chat_id, user_id), None)
+            await _execute_kick(
+                chat_id, user_id, call_input,
+                was_already_muted=is_muted,
+                reason=reason_nm,
+            )
+            return
+
         has_link = await _query_bio_from_db(chat_id, user_id)
 
-        # BUG FIX: Hanya cache hasil yang definitif (True/False).
-        # Jika has_link is None berarti bot pemantau belum scan user ini —
-        # JANGAN cache sebagai False, nanti user yang seharusnya di-kick
-        # akan lolos selama 10 menit karena cache miss terus dianggap "aman".
-        if has_link is not None:
-            _bio_cache[(chat_id, user_id)] = (has_link, time.monotonic())
+        # Cache hanya hasil definitif True/False.
+        # None (bio kosong) TIDAK di-cache agar dicek ulang di siklus berikutnya.
+        if has_link is True:
+            _bio_cache[(chat_id, user_id)] = (True, time.monotonic())
+        elif has_link is False:
+            _bio_cache[(chat_id, user_id)] = (False, time.monotonic())
 
-        if has_link:
-            await _execute_kick(chat_id, user_id, call_input, was_already_muted=is_muted)
+        if has_link is True:
+            await _execute_kick(
+                chat_id, user_id, call_input,
+                was_already_muted=is_muted,
+                reason="bio mengandung link",
+            )
         else:
+            # has_link = False atau None → tidak ada link / bio kosong
             _processing_kick.discard((chat_id, user_id))
-            # Unmute HANYA jika semua kondisi terpenuhi:
-            #   1. User sedang di-mute (is_muted=True)
-            #   2. Bio sudah bersih (has_link=False)
-            #   3. Userbot yang dulu mute user ini — bukan admin lain
-            #      (dicek dari DB collection vc_muted_by_ub)
-            if is_muted and has_link is False:
-                was_ub_muted = await _ub_muted_this_user(chat_id, user_id)
+
+            if is_muted:
+                # BUG 2 FIX: Cek dua lapis — Telegram API field ATAU DB record
+                # Keduanya berarti "userbot yang mute" → boleh unmute
+                was_ub_muted = muted_by_you or await _ub_muted_this_user(chat_id, user_id)
                 if was_ub_muted:
+                    reason = "bio bersih" if has_link is False else "bio kosong/tidak tersedia"
+                    src_label = "Telegram API" if muted_by_you else "DB record"
+                    print(
+                        f"[UB-Unmute] uid={user_id} grup={chat_id}: "
+                        f"{reason} ({src_label}) → unmute mic."
+                    )
                     asyncio.create_task(
                         _unmute_user_in_vc(chat_id, user_id, call_input)
                     )
                 else:
                     print(
                         f"[UB-Unmute] uid={user_id} grup={chat_id}: "
-                        "muted oleh admin lain — userbot tidak membuka mute"
+                        "muted oleh admin lain — userbot tidak membuka mute mic"
                     )
+            else:
+                # User tidak sedang admin-muted → bersihkan record DB yang mungkin stale
+                # (misal: admin sudah unmute duluan, record userbot belum terhapus)
+                asyncio.create_task(_remove_ub_muted(chat_id, user_id))
 
     except Exception as e:
         print(f"[UB-Query] Error uid={user_id} chat={chat_id}: {e}")
@@ -1886,14 +1570,17 @@ async def _query_bio_from_db(chat_id: int, user_id: int) -> bool | None:
               → tidak bertindak (bukan berarti bot pemantau mati)
     """
     from monitor_bot_reference import force_check_vc_join, _active_instances
-    # ── Cek dulu apakah instance terdaftar ───────────────────────────────────
-    if _active_instances.get(chat_id) is None:
+    # FIX 5: Isolasi per grup — HANYA gunakan bot pemantau milik chat_id ini.
+    # force_check_vc_join(chat_id, user_id) membaca _active_instances[chat_id],
+    # sehingga data grup A tidak pernah dicek oleh bot pemantau grup B.
+    instance = _active_instances.get(chat_id)
+    if instance is None:
         print(
             f"[UB-Bio] chat={chat_id} uid={user_id} "
-            "⚠️  instance bot pemantau belum terdaftar di registry — skip"
+            "⚠️  bot pemantau grup ini belum terdaftar di registry — skip"
         )
         return None
-    # ── Instance ada → minta fresh check ─────────────────────────────────────
+    # ── Instance ada → minta fresh check dari bot pemantau GRUP INI saja ─────
     result = await force_check_vc_join(chat_id, user_id)
     if result is None:
         # None dari force_check_vc_join = bot AKTIF tapi bio tidak tersedia
@@ -1916,6 +1603,92 @@ async def _query_bio_from_db(chat_id: int, user_id: int) -> bool | None:
 _monitor_username_cache: dict[int, str] = {}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# LOG OS — kirim log mute/unmute userbot ke channel khusus LOG_OS
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _log_os_action(chat_id: int, user_id: int, action: str, reason: str) -> None:
+    """
+    Kirim log tindakan userbot (mute/unmute mic) ke channel LOG_OS.
+
+    action : label singkat, contoh "MUTE-MIC" atau "UNMUTE-MIC"
+    reason : keterangan detail, contoh "bio mengandung link" atau "non-member grup"
+    """
+    if not LOG_OS or not _bot_ref:
+        return
+    try:
+        name  = str(user_id)
+        uname = f"id:{user_id}"
+        try:
+            u = await _bot_ref.get_users(user_id)
+            name  = u.first_name or str(user_id)
+            uname = f"@{u.username}" if u.username else f"id:{user_id}"
+        except Exception:
+            pass
+
+        icon   = "🔇" if "MUTE" in action.upper() and "UNMUTE" not in action.upper() else "🔊"
+        waktu  = _dt_vc.now(_WIB_VC).strftime("%H:%M:%S · %d %b %Y WIB")
+        text = (
+            f"{icon} <b>Security OS — {action}</b>\n"
+            f"<code>Grup : {chat_id}</code>\n"
+            f"👤 {name} (<code>{user_id}</code>) {uname}\n"
+            f"📌 Alasan : {reason}\n"
+            f"🕐 {waktu}"
+        )
+        await _bot_ref.send_message(LOG_OS, text, parse_mode=ParseMode.HTML)
+    except FloodWait as fw:
+        await asyncio.sleep(fw.value + 1)
+    except Exception as e:
+        print(f"[UB-LogOS] Gagal kirim log ke LOG_OS: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CEK KEANGGOTAAN GRUP — untuk mute non-member di obrolan suara
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _is_group_member(chat_id: int, user_id: int) -> bool | None:
+    """
+    Cek apakah user adalah anggota grup.
+
+    Return:
+      True  → user adalah anggota grup (owner/admin/member/restricted)
+      False → user bukan anggota (LEFT/BANNED atau UserNotParticipant)
+      None  → tidak bisa menentukan (error lain, FloodWait, dsb)
+
+    Hasil di-cache 2 menit agar tidak spam API saat banyak peserta masuk VC.
+    """
+    if not userbot:
+        return None
+
+    key = (chat_id, user_id)
+    cached = _member_cache.get(key)
+    if cached:
+        is_mem, ts = cached
+        if time.monotonic() - ts < _MEMBER_CACHE_TTL:
+            return is_mem
+
+    try:
+        from pyrogram.enums import ChatMemberStatus
+        member = await userbot.get_chat_member(chat_id, user_id)
+        is_member = member.status not in (
+            ChatMemberStatus.BANNED,
+            ChatMemberStatus.LEFT,
+        )
+        _member_cache[key] = (is_member, time.monotonic())
+        return is_member
+    except FloodWait as fw:
+        print(f"[UB-Member] FloodWait {fw.value}s saat cek member uid={user_id} grup={chat_id}")
+        await asyncio.sleep(fw.value + 1)
+        return None
+    except Exception as e:
+        err = str(e).lower()
+        if "user_not_participant" in err or "not_participant" in err or "member_not_found" in err:
+            _member_cache[key] = (False, time.monotonic())
+            return False
+        # Error lain (peer tidak dikenal, dsb) → tidak bisa menentukan
+        return None
+
+
 async def _get_monitor_username(monitor_bot_id: int) -> str:
     """Ambil username bot pemantau (cache di memory). Masih dipakai di panel UI."""
     if monitor_bot_id in _monitor_username_cache:
@@ -1933,7 +1706,8 @@ async def _get_monitor_username(monitor_bot_id: int) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# EKSEKUSI: KICK DARI VOICE CHAT + PERINGATAN
+# EKSEKUSI: MUTE MIC DI VOICE CHAT + PERINGATAN
+# (Security OS: BUKAN kick dari grup — hanya mute mic VC)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _execute_kick(
@@ -1941,6 +1715,7 @@ async def _execute_kick(
     user_id: int,
     call_input,
     was_already_muted: bool = False,
+    reason: str = "bio mengandung link",
 ) -> None:
     """
     Mute mic user dari voice chat, lalu antrekan peringatan ke grup.
@@ -1950,17 +1725,23 @@ async def _execute_kick(
     Dalam kasus ini: lakukan mute ulang (agar tindakan konsisten), tapi
     TIDAK kirim notifikasi ke grup — notif hanya untuk perubahan status.
 
+    reason: alasan mute — diteruskan ke _do_send_warning dan LOG_OS.
+
     Alur:
       1. Mute mic via _kick_from_voice
-      2. Catat ke DB (vc_muted_by_ub) bahwa userbot yang mute-kan
-      3. Antrekan notifikasi HANYA jika ini perubahan status (was_already_muted=False)
+      2. Log ke LOG_OS (Perubahan 2)
+      3. Catat ke DB (vc_muted_by_ub) bahwa userbot yang mute-kan
+      4. Antrekan notifikasi HANYA jika ini perubahan status (was_already_muted=False)
     """
     try:
         await _kick_from_voice(chat_id, user_id, call_input)
+        # Perubahan 2: log ke channel LOG_OS
+        asyncio.create_task(_log_os_action(chat_id, user_id, "MUTE-MIC", reason))
         # Catat ke DB bahwa userbot yang mute-kan user ini
         asyncio.create_task(_record_ub_muted(chat_id, user_id))
         # Antrekan notifikasi HANYA jika ini perubahan status
         if not was_already_muted:
+            _pending_warn_reason[(chat_id, user_id)] = reason
             _enqueue_warning(chat_id, user_id)
         else:
             print(
@@ -2085,6 +1866,12 @@ async def _unmute_user_in_vc(chat_id: int, user_id: int, call_input) -> None:
         # Hapus cache bio agar status selalu dicek fresh berikutnya
         _bio_cache.pop((chat_id, user_id), None)
 
+        # Perubahan 2: log unmute ke channel LOG_OS
+        if changed:
+            asyncio.create_task(
+                _log_os_action(chat_id, user_id, "UNMUTE-MIC", "bio bersih / tidak ada link")
+            )
+
         # Kirim notifikasi ke grup HANYA jika ini perubahan status
         if changed and _bot_ref:
             try:
@@ -2162,11 +1949,20 @@ async def _do_send_warning(chat_id: int, user_id: int) -> None:
         mention = f"<a href='tg://user?id={user_id}'>{name}</a>"
 
         # Kirim peringatan di grup via bot biasa — tangani FloodWait
-        warn_msg = (
-            f"🔇 {mention} mic-nya di-mute di obrolan suara.\n"
-            f"<i>Bio Anda mengandung link/username. "
-            f"Hapus link atau privatkan bio agar mic dapat diaktifkan kembali.</i>"
-        )
+        # Perubahan 2: ambil alasan dari _pending_warn_reason
+        warn_reason = _pending_warn_reason.pop((chat_id, user_id), "bio mengandung link")
+        if "non-member" in warn_reason:
+            warn_msg = (
+                f"🔇 {mention} mic-nya di-mute di obrolan suara.\n"
+                f"<i>Anda bukan anggota grup ini. "
+                f"Bergabunglah ke grup terlebih dahulu agar mic dapat diaktifkan.</i>"
+            )
+        else:
+            warn_msg = (
+                f"🔇 {mention} mic-nya di-mute di obrolan suara.\n"
+                f"<i>Bio Anda mengandung link/username. "
+                f"Hapus link atau privatkan bio agar mic dapat diaktifkan kembali.</i>"
+            )
         sent_warn = None
         try:
             sent_warn = await _bot_ref.send_message(chat_id, warn_msg, parse_mode=ParseMode.HTML)

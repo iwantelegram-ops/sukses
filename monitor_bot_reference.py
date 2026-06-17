@@ -80,7 +80,7 @@ API_HASH  = os.environ.get("API_HASH", "")
 BIO_RECHECK_SECS      = int(os.environ.get("BIO_RECHECK_SECS", 600))
 
 # TTL data bio di MongoDB — dokumen dihapus otomatis setelah N detik (default 5 menit)
-BIO_TTL_SECS = int(os.environ.get("BIO_TTL_SECS", 300))
+BIO_TTL_SECS = int(os.environ.get("BIO_TTL_SECS", 60))   # BUG 3 FIX: 60 detik — sinkron dengan VC_JOIN_RECHECK_SECS & _BIO_CACHE_TTL userbot
 
 # ── Throttle khusus per skenario ──────────────────────────────────────────────
 VC_JOIN_RECHECK_SECS = int(os.environ.get("VC_JOIN_RECHECK_SECS", 60))
@@ -189,51 +189,97 @@ class MonitorInstance:
         """
         Ambil bio user via Telegram API. Return None jika gagal.
 
-        Strategi dua langkah:
-        1. resolve_peer(user_id) → GetFullUser  ← cepat, tapi bisa gagal
-           jika bot belum pernah berinteraksi dengan user ini.
-        2. Fallback: get_chat_member(chat_id, user_id) → resolve peer dari
-           objek member → GetFullUser. Cara ini bekerja selama user adalah
-           anggota grup yang dipantau bot.
+        Bekerja untuk SIAPAPUN yang ada di VC — termasuk user yang BUKAN member
+        grup. Fallback 2 (get_chat_member) akan gagal untuk non-member tapi
+        ditangkap dan dilanjutkan ke fallback 3 & 4.
+
+        Strategi EMPAT langkah:
+        1. resolve_peer(user_id) → GetFullUser  ← cepat
+        2. get_chat_member(chat_id, user_id) → warm session → GetFullUser
+           ← GAGAL untuk non-member (UserNotParticipant), dilanjutkan ke F3
+        3. InputUser(user_id, access_hash=0) → GetFullUser
+           ← bekerja untuk user publik
+        4. get_users([user_id]) → resolve_peer → GetFullUser
+           ← last resort, paksa Telegram kirim access_hash
         """
+        async def _getfull(peer) -> str | None:
+            try:
+                full = await self.client.invoke(raw_fns.users.GetFullUser(id=peer))
+                return getattr(full.full_user, "about", None) or ""
+            except Exception:
+                return None
+
+        # ── 1. Cepat: resolve_peer langsung ─────────────────────────────────
         try:
             peer = await self.client.resolve_peer(user_id)
-            full = await self.client.invoke(
-                raw_fns.users.GetFullUser(id=peer)
-            )
-            return getattr(full.full_user, "about", None) or ""
+            bio = await _getfull(peer)
+            if bio is not None:
+                return bio
         except FloodWait as fw:
-            print(
-                f"[Monitor {self.chat_id}] FloodWait {fw.value}s "
-                f"uid={user_id}"
-            )
+            print(f"[Monitor {self.chat_id}] FloodWait {fw.value}s uid={user_id}")
             await asyncio.sleep(fw.value + 1)
             return None
         except (PeerIdInvalid, KeyError):
-            # ── Fallback: bot belum kenal user → coba via get_chat_member ──
-            try:
-                member = await self.client.get_chat_member(self.chat_id, user_id)
-                if member and member.user:
-                    peer = await self.client.resolve_peer(member.user.id)
-                    full = await self.client.invoke(
-                        raw_fns.users.GetFullUser(id=peer)
-                    )
-                    return getattr(full.full_user, "about", None) or ""
-            except FloodWait as fw2:
-                print(
-                    f"[Monitor {self.chat_id}] FloodWait (fallback) {fw2.value}s "
-                    f"uid={user_id}"
-                )
-                await asyncio.sleep(fw2.value + 1)
-            except Exception:
-                pass
-            return None
+            pass
         except Exception as e:
-            print(
-                f"[Monitor {self.chat_id}] Gagal ambil bio "
-                f"uid={user_id}: {e}"
-            )
+            print(f"[Monitor {self.chat_id}] Gagal ambil bio uid={user_id}: {e}")
             return None
+
+        # ── 2. Fallback: get_chat_member → warm session → resolve_peer ──────
+        #    CATATAN: Gagal untuk non-member (UserNotParticipant) — ditangkap,
+        #    lanjut ke fallback 3 & 4. Non-member di VC tetap diperiksa.
+        try:
+            member = await self.client.get_chat_member(self.chat_id, user_id)
+            if member and member.user:
+                try:
+                    peer = await self.client.resolve_peer(member.user.id)
+                    bio = await _getfull(peer)
+                    if bio is not None:
+                        print(f"[Monitor {self.chat_id}] uid={user_id}: bio via get_chat_member ✓")
+                        return bio
+                except Exception:
+                    pass
+        except FloodWait as fw2:
+            print(f"[Monitor {self.chat_id}] FloodWait (fallback2) {fw2.value}s uid={user_id}")
+            await asyncio.sleep(fw2.value + 1)
+            return None
+        except Exception as e2:
+            # UserNotParticipant = non-member; error lain = peer tak terjangkau
+            # Tetap lanjut ke fallback 3 & 4 — jangan berhenti di sini
+            print(
+                f"[Monitor {self.chat_id}] Fallback2 gagal uid={user_id} "
+                f"({type(e2).__name__}) — lanjut fallback 3+4"
+            )
+
+        # ── 3. Fallback: InputUser(access_hash=0) ───────────────────────────
+        try:
+            from pyrogram.raw.types import InputUser as _RawInputUser
+            peer = _RawInputUser(user_id=user_id, access_hash=0)
+            bio = await _getfull(peer)
+            if bio is not None:
+                print(f"[Monitor {self.chat_id}] uid={user_id}: bio via access_hash=0 ✓")
+                return bio
+        except Exception:
+            pass
+
+        # ── 4. Fallback: get_users → paksa Pyrogram fetch access_hash ────────
+        try:
+            users_result = await self.client.get_users(user_id)
+            u = users_result[0] if isinstance(users_result, list) else users_result
+            if u:
+                peer = await self.client.resolve_peer(u.id)
+                bio = await _getfull(peer)
+                if bio is not None:
+                    print(f"[Monitor {self.chat_id}] uid={user_id}: bio via get_users ✓")
+                    return bio
+        except FloodWait as fw4:
+            print(f"[Monitor {self.chat_id}] FloodWait (fallback4) {fw4.value}s uid={user_id}")
+            await asyncio.sleep(fw4.value + 1)
+        except Exception:
+            pass
+
+        print(f"[Monitor {self.chat_id}] ⚠️  Semua fallback gagal uid={user_id} — bio tidak tersedia")
+        return None
 
     async def check_and_save(
         self, user_id: int, force: bool = False
@@ -307,6 +353,13 @@ class MonitorInstance:
         """
         Paksa re-check bio saat user NAIK KE VOICE CHAT.
         Cache khusus VC: VC_JOIN_RECHECK_SECS (default 60 detik).
+
+        BUG 2 FIX: Jika user tidak dikenal bot (tidak ada di DB) meski dalam
+        throttle → bypass throttle, paksa fetch fresh dari Telegram API.
+        Memastikan user yang baru pertama kali naik VC tetap di-scan.
+
+        BUG 3 FIX (timestamp): Jika fetch gagal (result=None), timestamp
+        tidak disimpan → scan berikutnya langsung retry tanpa tunggu 60 detik.
         """
         now      = time.time()
         last_vc  = self._last_vc_checked.get(user_id, 0)
@@ -317,11 +370,18 @@ class MonitorInstance:
             doc = await bio_col.find_one(
                 {"chat_id": self.chat_id, "user_id": user_id}
             )
-            return doc.get("has_link", False) if doc else None
+            if doc is not None:
+                # Data fresh ada di DB → pakai langsung
+                return doc.get("has_link", False)
+            # BUG 2 FIX: Tidak ada di DB meski dalam throttle → bypass, fetch fresh
+            # User belum pernah typing → bot belum kenal → harus paksa cek
 
-        self._last_vc_checked[user_id] = now
-        self._last_checked[user_id]    = now
         result = await self.check_and_save(user_id, force=True)
+        # BUG 3 FIX: Simpan timestamp HANYA jika fetch berhasil (result is not None)
+        # Jika gagal → tidak simpan timestamp → scan berikutnya langsung retry
+        if result is not None:
+            self._last_vc_checked[user_id] = now
+            self._last_checked[user_id]    = now
         print(
             f"[Monitor {self.chat_id}] VC-join uid={user_id} "
             f"→ bio fresh, has_link={result}"

@@ -10,7 +10,7 @@ dnspython
 # ── Wajib untuk MongoDB (Security OS + session userbot tersimpan di cloud) ────
 # Hapus tanda # jika MONGO_URL diisi di .env
 # motor==3.3.2
-# pymongo==4.6.1
+# pymongo[srv]==4.7
 
 # ── Requirements untuk fitur Userbot naik Obrolan Suara (VC) ────────────────
 # TIDAK memerlukan library tambahan — userbot naik VC via raw MTProto pyrogram.

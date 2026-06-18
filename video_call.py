@@ -471,7 +471,12 @@ _ADMIN_CACHE_TTL = 300.0   # 5 menit — refresh admin list tiap 5 menit
 #   • Telegram API tidak di-spam jika user keluar-masuk VC berulang.
 # Key: (chat_id, user_id) — cache TIDAK pernah dipakai lintas grup.
 _bio_cache: dict[tuple[int, int], tuple[bool, float]] = {}
-_BIO_CACHE_TTL = 60.0   # 60 detik — selaraskan dengan VC_JOIN_RECHECK_SECS
+# FIX: sebelumnya hardcoded 60.0 — tidak ikut berubah saat user mengubah
+# BIO_TTL_SECS di .env, sehingga cache userbot bisa lebih basi/lebih segar
+# daripada TTL Mongo & throttle bot pemantau. Sekarang ikut env yang sama
+# agar semua lapisan cache (Mongo TTL, bot pemantau, bot utama, userbot)
+# selalu konsisten satu nilai.
+_BIO_CACHE_TTL = float(os.environ.get("BIO_TTL_SECS", 60))
 
 # ── Penanda pesan jawaban bot pemantau ───────────────────────────────────────
 _pending_checks: dict[tuple[int, int], int] = {}
@@ -1898,25 +1903,32 @@ async def _query_monitor_then_kick(
             # has_link=True dari bot pemantau = bio berhasil dibaca & ada link.
             # Ini BUKAN peer_invalid — tidak perlu follow-up khusus.
         elif has_link is None:
-            # ── PEER INVALID: bot pemantau (bot biasa) gagal fetch bio user ──
-            # Terjadi karena user belum pernah berinteraksi di grup, sehingga
-            # bot pemantau tidak mengenali peer-nya (PeerIdInvalid / semua
-            # fallback gagal di _fetch_bio). Return None dari _query_bio_from_db.
-            # Tindakan: mute mic user ini karena identitasnya tidak bisa diverifikasi.
-            print(
-                f"[UB-VC] uid={user_id} grup={chat_id}: "
-                f"peer_invalid — bot pemantau gagal fetch bio (user belum pernah "
-                f"berinteraksi di grup) → mute mic."
-            )
-            await _execute_kick(
-                chat_id, user_id, call_input,
-                was_already_muted=is_muted,
-                reason="peer tidak dikenal bot pemantau (belum pernah berinteraksi)",
-            )
-            # Fitur 1: Catat ke secos_muted_users (TTL 30 detik)
-            _secos_record_mute(chat_id, user_id, "peer_invalid")
-            # Fitur 2: Jadwalkan follow-up recheck 1 menit kemudian
-            _secos_schedule_followup(chat_id, [(user_id, "peer_invalid")])
+            # ── PEER INVALID: bot pemantau gagal fetch bio (peer tidak dikenal) ──
+            # Bukan berarti ada link — identitas user belum terverifikasi.
+            was_ub_muted = muted_by_you or await _ub_muted_this_user(chat_id, user_id)
+            if was_ub_muted:
+                print(
+                    f"[UB-VC] uid={user_id} grup={chat_id}: "
+                    f"peer_invalid (is_muted_live={is_muted}) tapi tercatat di-mute userbot "
+                    f"→ unmute mic."
+                )
+                _enqueue_unmute_mic(chat_id, user_id, call_input, "bio tidak tersedia (peer invalid)")
+                _processing_kick.discard((chat_id, user_id))
+            else:
+                print(
+                    f"[UB-VC] uid={user_id} grup={chat_id}: "
+                    f"peer_invalid — bot pemantau gagal fetch bio (user belum pernah "
+                    f"berinteraksi di grup) → mute mic."
+                )
+                await _execute_kick(
+                    chat_id, user_id, call_input,
+                    was_already_muted=is_muted,
+                    reason="peer tidak dikenal bot pemantau (belum pernah berinteraksi)",
+                )
+                # Fitur 1: Catat ke secos_muted_users (TTL 30 detik)
+                _secos_record_mute(chat_id, user_id, "peer_invalid")
+                # Fitur 2: Jadwalkan follow-up recheck 1 menit kemudian
+                _secos_schedule_followup(chat_id, [(user_id, "peer_invalid")])
         else:
             # has_link = False → bio bersih, tidak ada link
             _processing_kick.discard((chat_id, user_id))

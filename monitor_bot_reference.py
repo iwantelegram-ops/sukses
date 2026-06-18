@@ -52,7 +52,12 @@ VARIABEL .env:
   MONGO_URL          — HARUS SAMA dengan bot utama (DB bersama)
   MONGO_DB_NAME      — HARUS SAMA dengan bot utama
   CODE_BOT           — HARUS SAMA dengan bot utama
-  BIO_TTL_SECS           — TTL data bio di DB sebelum dihapus (default: 300 = 5 menit)
+  BIO_TTL_SECS           — TTL data bio di DB sebelum dihapus (default: 60 detik).
+                            Semua throttle in-memory (BIO_RECHECK_SECS,
+                            VC_JOIN_RECHECK_SECS, TYPING_RECHECK_SECS) serta
+                            cache di bio.py dan video_call.py ikut nilai ini
+                            secara default — ubah satu env var ini cukup untuk
+                            menyamakan seluruh lapisan cache/TTL bio di sistem.
 """
 
 from __future__ import annotations
@@ -77,14 +82,24 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
 API_ID    = int(os.environ.get("API_ID", 0))
 API_HASH  = os.environ.get("API_HASH", "")
 
-BIO_RECHECK_SECS      = int(os.environ.get("BIO_RECHECK_SECS", 600))
+# TTL data bio di MongoDB — dokumen dihapus otomatis setelah N detik (default 60)
+BIO_TTL_SECS = int(os.environ.get("BIO_TTL_SECS", 60))
 
-# TTL data bio di MongoDB — dokumen dihapus otomatis setelah N detik (default 5 menit)
-BIO_TTL_SECS = int(os.environ.get("BIO_TTL_SECS", 60))   # BUG 3 FIX: 60 detik — sinkron dengan VC_JOIN_RECHECK_SECS & _BIO_CACHE_TTL userbot
+# FIX: Semua throttle in-memory di bawah ini SEBELUMNYA punya default sendiri
+# yang jauh lebih besar dari BIO_TTL_SECS (600 & 300 detik vs TTL 60 detik).
+# Akibatnya: dokumen bio sudah dihapus MongoDB (sesuai TTL), tapi throttle
+# in-memory _last_checked / _last_typing_checked masih menganggap "baru saja
+# dicek" sehingga check_and_save(force=False) SKIP fetch ulang ke Telegram API
+# dan mengembalikan None / data DB basi — bio yang sudah dibersihkan user
+# tetap dianggap "ada link" sampai throttle lama itu habis (bisa 5-10 menit).
+# Sekarang semua throttle ini default-nya MENGIKUTI BIO_TTL_SECS, supaya satu
+# env var BIO_TTL_SECS mengatur seluruh lapisan cache secara konsisten.
+# Tetap bisa di-override individual lewat env var masing-masing jika perlu.
+BIO_RECHECK_SECS      = int(os.environ.get("BIO_RECHECK_SECS", BIO_TTL_SECS))
 
 # ── Throttle khusus per skenario ──────────────────────────────────────────────
-VC_JOIN_RECHECK_SECS = int(os.environ.get("VC_JOIN_RECHECK_SECS", 60))
-TYPING_RECHECK_SECS  = int(os.environ.get("TYPING_RECHECK_SECS", 300))
+VC_JOIN_RECHECK_SECS = int(os.environ.get("VC_JOIN_RECHECK_SECS", BIO_TTL_SECS))
+TYPING_RECHECK_SECS  = int(os.environ.get("TYPING_RECHECK_SECS", BIO_TTL_SECS))
 
 # ── Pola deteksi link di bio ──────────────────────────────────────────────────
 LINK_PATTERN = re.compile(

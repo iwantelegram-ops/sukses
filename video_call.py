@@ -1828,23 +1828,29 @@ async def _query_monitor_then_kick(
     try:
         # ── VIP Guard: cek paling awal — sebelum non-member dan bio check ─────
         # User VIP (free_per_group) bebas dari aturan mute Security OS.
-        # TAPI: jika VIP sedang di-mute oleh userbot (vc_muted_by_ub) dan
-        # mic-nya sedang muted (is_muted=True) → unmute mic VIP tersebut.
+        # TAPI: jika VIP sedang/pernah di-mute oleh userbot (vc_muted_by_ub)
+        # → unmute mic VIP tersebut.
         # Ini dipakai saat VIP kirim /unmutemic dan userbot naik VC untuk scan.
+        #
+        # FIX: jangan gate dengan `is_muted` (snapshot live can_self_unmute dari
+        # Telegram) — field ini tidak selalu sinkron tepat setelah userbot baru
+        # join VC, sehingga unmute bisa gagal terpicu meski DB sudah mencatat
+        # bahwa userbot yang mute user ini. DB vc_muted_by_ub / muted_by_you
+        # adalah sumber kebenaran yang lebih andal; is_muted hanya dipakai
+        # sebagai info log, bukan syarat wajib.
         if await _is_vip_user(chat_id, user_id):
-            if is_muted:
-                was_ub_muted = muted_by_you or await _ub_muted_this_user(chat_id, user_id)
-                if was_ub_muted:
-                    print(
-                        f"[UB-VC] uid={user_id} grup={chat_id}: VIP + di-mute userbot "
-                        "→ unmute mic VIP."
-                    )
-                    _enqueue_unmute_mic(chat_id, user_id, call_input, "VIP — mic diaktifkan kembali")
-                else:
-                    print(
-                        f"[UB-VC] uid={user_id} grup={chat_id}: VIP muted oleh admin lain "
-                        "→ tidak di-unmute userbot."
-                    )
+            was_ub_muted = muted_by_you or await _ub_muted_this_user(chat_id, user_id)
+            if was_ub_muted:
+                print(
+                    f"[UB-VC] uid={user_id} grup={chat_id}: VIP + tercatat di-mute userbot "
+                    f"(is_muted_live={is_muted}) → unmute mic VIP."
+                )
+                _enqueue_unmute_mic(chat_id, user_id, call_input, "VIP — mic diaktifkan kembali")
+            elif is_muted:
+                print(
+                    f"[UB-VC] uid={user_id} grup={chat_id}: VIP muted oleh admin lain "
+                    "→ tidak di-unmute userbot."
+                )
             else:
                 print(f"[UB-VC] uid={user_id} grup={chat_id}: VIP → skip semua cek Security OS.")
             _processing_kick.discard((chat_id, user_id))
@@ -1915,27 +1921,31 @@ async def _query_monitor_then_kick(
             # has_link = False → bio bersih, tidak ada link
             _processing_kick.discard((chat_id, user_id))
 
-            if is_muted:
-                # BUG 2 FIX: Cek dua lapis — Telegram API field ATAU DB record
-                # Keduanya berarti "userbot yang mute" → boleh unmute
-                was_ub_muted = muted_by_you or await _ub_muted_this_user(chat_id, user_id)
-                if was_ub_muted:
-                    reason = "bio bersih" if has_link is False else "bio kosong/tidak tersedia"
-                    src_label = "Telegram API" if muted_by_you else "DB record"
-                    print(
-                        f"[UB-Unmute] uid={user_id} grup={chat_id}: "
-                        f"{reason} ({src_label}) → antri unmute mic ke worker."
-                    )
-                    # Antri unmute ke worker (bukan panggil langsung — aman API per grup)
-                    _enqueue_unmute_mic(chat_id, user_id, call_input, reason)
-                else:
-                    print(
-                        f"[UB-Unmute] uid={user_id} grup={chat_id}: "
-                        "muted oleh admin lain — userbot tidak membuka mute mic"
-                    )
+            # FIX: jangan gate cek unmute dengan `is_muted` (snapshot live
+            # can_self_unmute dari Telegram) — field ini tidak selalu sinkron
+            # tepat setelah userbot baru join VC, sehingga unmute via
+            # /unmutemic bisa gagal terpicu meski DB vc_muted_by_ub sudah
+            # mencatat userbot yang mute user ini. Cek DB/muted_by_you dulu
+            # sebagai sumber kebenaran utama; is_muted hanya info pendukung.
+            was_ub_muted = muted_by_you or await _ub_muted_this_user(chat_id, user_id)
+            if was_ub_muted:
+                reason = "bio bersih" if has_link is False else "bio kosong/tidak tersedia"
+                src_label = "Telegram API" if muted_by_you else "DB record"
+                print(
+                    f"[UB-Unmute] uid={user_id} grup={chat_id}: "
+                    f"{reason} ({src_label}, is_muted_live={is_muted}) → antri unmute mic ke worker."
+                )
+                # Antri unmute ke worker (bukan panggil langsung — aman API per grup)
+                _enqueue_unmute_mic(chat_id, user_id, call_input, reason)
+            elif is_muted:
+                print(
+                    f"[UB-Unmute] uid={user_id} grup={chat_id}: "
+                    "muted oleh admin lain — userbot tidak membuka mute mic"
+                )
             else:
-                # User tidak sedang admin-muted → bersihkan record DB yang mungkin stale
-                # (misal: admin sudah unmute duluan, record userbot belum terhapus)
+                # Tidak di-mute live DAN tidak ada record DB → bersihkan
+                # record stale jika ada (misal: admin sudah unmute duluan,
+                # record userbot belum terhapus).
                 _safe_task(_remove_ub_muted(chat_id, user_id), tag="rm-muted-stale")
 
     except Exception as e:
@@ -2331,6 +2341,23 @@ async def _is_vip_user(chat_id: int, user_id: int) -> bool:
     except Exception as e:
         print(f"[UB-VIP] Gagal cek VIP uid={user_id} grup={chat_id}: {e}")
         return False   # safe default: anggap bukan VIP jika cek gagal
+
+
+def invalidate_vip_cache(chat_id: int, user_id: int) -> None:
+    """
+    Hapus entri cache VIP untuk (chat_id, user_id) ini.
+
+    WAJIB dipanggil setelah /vip, /unvip, atau tombol UI VIP/unvip mengubah
+    status VIP di DB (free_per_group). Tanpa ini, _is_vip_user() bisa
+    mengembalikan status VIP yang sudah basi selama TTL cache (3 menit) belum
+    habis — contoh kasus nyata: user baru di-VIP-kan lalu langsung /unmutemic
+    dalam window 3 menit tersebut, bot masih membaca cache lama "bukan VIP"
+    sehingga /unmutemic salah jalur (cek bio dulu) dan userbot tidak/lambat
+    naik ke voice chat.
+
+    Aman dipanggil meski entri belum ada di cache (no-op).
+    """
+    _vip_cache.pop((chat_id, user_id), None)
 
 
 async def _cache_cleanup_loop() -> None:

@@ -26,6 +26,16 @@ CATATAN ARSITEKTUR:
     agar tidak bentrok dengan siklus 30 menit atau follow-up recheck.
   - Worker queue di video_call.py yang mengatur eksekusi berurutan dan jeda antar grup.
   - Lock inspeksi (_vc_inspection_lock) TIDAK dipakai di sini — sudah diurus worker.
+
+FIX (cache VIP basi):
+  _is_vip_user() di video_call.py punya cache 3 menit. Jika user baru saja
+  dijadikan VIP (via /vip atau tombol UI) lalu langsung kirim /unmutemic
+  dalam window 3 menit tersebut, cache lama bisa membuat user terdeteksi
+  "bukan VIP" sehingga jatuh ke jalur cek-bio biasa — kalau bio masih ada
+  link, command berhenti tanpa pernah antri scan VC (userbot tidak naik).
+  Perbaikan: command /vip dan /unvip (serta tombol UI-nya) sekarang memanggil
+  video_call.invalidate_vip_cache(chat_id, user_id) setiap kali status VIP
+  berubah, agar /unmutemic langsung membaca status VIP terbaru tanpa delay.
 """
 
 import asyncio
@@ -96,10 +106,12 @@ async def cmd_unmutemic(client: Client, message: Message):
     # ── Cek apakah Security OS aktif untuk grup ini ──────────────────────────
     sec_doc = await _sec_os_get(cid)
     if not sec_doc.get("enabled"):
+        _unmutemic_cooldown.pop((cid, uid), None)
         return
 
     # ── Cek userbot siap ─────────────────────────────────────────────────────
     if not is_userbot_ready():
+        _unmutemic_cooldown.pop((cid, uid), None)
         return
 
     # ── Cek apakah user adalah Member VIP grup ini ──────────────────────────

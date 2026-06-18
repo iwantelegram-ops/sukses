@@ -47,6 +47,13 @@ async def cmd_vip(client: Client, message: Message):
         {"$set": {"user_id": target, "chat_id": cid}},
         upsert=True,
     )
+    # Invalidasi cache VIP agar /unmutemic langsung mengenali status VIP baru,
+    # tidak menunggu TTL cache 3 menit habis.
+    try:
+        from video_call import invalidate_vip_cache
+        invalidate_vip_cache(cid, target)
+    except ImportError:
+        pass
     res = await message.reply(
         f"👑 <code>{target}</code> kini menjadi Member VIP — bebas dari semua filter di grup ini.",
         parse_mode=ParseMode.HTML
@@ -70,6 +77,13 @@ async def cmd_unvip(client: Client, message: Message):
         return await auto_delete_reply([res, message], delay=DELAY)
 
     result = await free_col.delete_one({"user_id": target, "chat_id": cid})
+    # Invalidasi cache VIP agar perubahan langsung berlaku, bukan menunggu
+    # TTL cache 3 menit habis (mis. user lain langsung kena cek bio lagi).
+    try:
+        from video_call import invalidate_vip_cache
+        invalidate_vip_cache(cid, target)
+    except ImportError:
+        pass
     text = (
         f"🗑️ <code>{target}</code> sudah bukan Member VIP — kembali difilter."
         if result.deleted_count else

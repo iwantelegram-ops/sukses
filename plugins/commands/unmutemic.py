@@ -3,18 +3,29 @@ plugins/commands/unmutemic.py
 ──────────────────────────────
 Perintah /unmutemic — minta inspeksi dadakan untuk membuka mute mic.
 
-FLOW:
+FLOW MEMBER BIASA:
   1. User kirim /unmutemic di grup
   2. Hapus pesan perintah segera
   3. Cek anti-spam (cooldown 5 menit per user per grup)
-  4. Cek apakah user ada di daftar yang pernah di-mute userbot (vc_muted_by_ub)
+  4. Cek apakah user pernah di-mute userbot (vc_muted_by_ub)
      → Tidak ada di daftar → abaikan
-  5. Bot pemantau cek bio user secara fresh
-     → Ada link → abaikan (user masih punya link, tidak di-unmute)
-     → Tidak ada link / tidak bisa cek → lanjut ke langkah 6
-  6. Hapus cache member user ini (agar non-member yang sudah join bisa dikenali)
-  7. Jalankan inspeksi dadakan (userbot naik VC dan scan peserta)
-     → Jika ada inspeksi lain sedang berjalan → tunggu / tambah jeda dulu
+  5. Cek Security OS aktif untuk grup ini
+  6. Cek bio user via bot pemantau (fresh check)
+     → Ada link → abaikan (user masih punya link)
+     → Tidak ada link / tidak bisa cek → lanjut
+  7. Invalidasi cache member, antri scan VC ke worker
+
+FLOW MEMBER VIP:
+  1–5. Sama seperti member biasa
+  6. SKIP cek bio (VIP bebas dari aturan bio link)
+  7. Invalidasi cache member, antri scan VC ke worker
+     Userbot cek: apakah VIP ada di VC? → unmute mic langsung
+
+CATATAN ARSITEKTUR:
+  - Inspeksi dadakan SELALU lewat _enqueue_vc_scan (bukan langsung _vc_scan_and_enforce)
+    agar tidak bentrok dengan siklus 30 menit atau follow-up recheck.
+  - Worker queue di video_call.py yang mengatur eksekusi berurutan dan jeda antar grup.
+  - Lock inspeksi (_vc_inspection_lock) TIDAK dipakai di sini — sudah diurus worker.
 """
 
 import asyncio
@@ -22,7 +33,6 @@ import time
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.enums import ParseMode
 
 from database import db
 
@@ -61,14 +71,14 @@ async def cmd_unmutemic(client: Client, message: Message):
     # Set cooldown sebelum proses agar spam saat proses berjalan juga ditolak
     _unmutemic_cooldown[(cid, uid)] = now
 
-    # ── Cek apakah user ada di daftar muted oleh userbot ────────────────────
+    # ── Import dari video_call ───────────────────────────────────────────────
     try:
         from video_call import (
             _ub_muted_this_user,
             _query_bio_from_db,
-            _vc_scan_and_enforce,
+            _is_vip_user,
+            _enqueue_vc_scan,
             is_userbot_ready,
-            get_vc_inspection_lock,
             _sec_os_get,
             _member_cache,
         )
@@ -76,10 +86,11 @@ async def cmd_unmutemic(client: Client, message: Message):
         print(f"[UnmuteMic] Import error dari video_call: {_e}")
         return
 
+    # ── Cek apakah user pernah di-mute userbot ──────────────────────────────
     was_muted = await _ub_muted_this_user(cid, uid)
     if not was_muted:
-        # User tidak ada di daftar muted userbot → abaikan
-        _unmutemic_cooldown.pop((cid, uid), None)   # kembalikan cooldown agar bisa coba lagi
+        # User tidak ada di daftar muted userbot → abaikan, kembalikan cooldown
+        _unmutemic_cooldown.pop((cid, uid), None)
         return
 
     # ── Cek apakah Security OS aktif untuk grup ini ──────────────────────────
@@ -87,59 +98,38 @@ async def cmd_unmutemic(client: Client, message: Message):
     if not sec_doc.get("enabled"):
         return
 
-    # ── Cek bio user via bot pemantau (fresh check) ──────────────────────────
+    # ── Cek userbot siap ─────────────────────────────────────────────────────
+    if not is_userbot_ready():
+        return
+
+    # ── Cek apakah user adalah Member VIP grup ini ──────────────────────────
+    is_vip = await _is_vip_user(cid, uid)
+
+    if is_vip:
+        # ── VIP: skip cek bio, langsung antri scan ──────────────────────────
+        # Userbot akan naik VC dan unmute mic VIP tanpa memedulikan bio link.
+        # _vc_scan_and_enforce akan menemukan user ini muted + _ub_muted_this_user=True
+        # + _is_vip_user=True → unmute mic langsung.
+        print(
+            f"[UnmuteMic] uid={uid} grup={cid}: VIP → skip cek bio, antri scan VC."
+        )
+        _member_cache.pop((cid, uid), None)
+        _enqueue_vc_scan(cid)
+        return
+
+    # ── Member biasa: cek bio via bot pemantau (fresh) ──────────────────────
     has_link = await _query_bio_from_db(cid, uid)
 
     if has_link is True:
-        # User masih punya link di bio → tidak di-unmute, abaikan
+        # User masih punya link di bio → tidak di-unmute
+        print(f"[UnmuteMic] uid={uid} grup={cid}: bio masih ada link → abaikan.")
         return
 
-    # has_link=False (bio bersih) atau None (tidak bisa cek)
-    # → lanjut inspeksi dadakan
-
-    if not is_userbot_ready():
-        # Userbot tidak aktif → tidak bisa inspeksi
-        return
-
-    # ── Invalidasi cache member agar re-check keanggotaan ────────────────────
-    # Non-member yang sudah bergabung grup perlu dicek ulang oleh _is_group_member
+    # has_link=False (bio bersih) atau None (tidak bisa cek) → lanjut
+    # Invalidasi cache member agar non-member yang sudah join bisa dikenali ulang
     _member_cache.pop((cid, uid), None)
 
-    # ── Jalankan inspeksi dadakan dengan global lock (cegah concurrent floodwait)
-    asyncio.create_task(_run_inspeksi_dadakan(cid, get_vc_inspection_lock))
-
-
-async def _run_inspeksi_dadakan(chat_id: int, get_lock_fn) -> None:
-    """
-    Jalankan _vc_scan_and_enforce dengan protection lock agar tidak berjalan
-    bersamaan dengan inspeksi grup lain (menghindari Telegram FloodWait).
-
-    Jika lock sedang dikuasai (inspeksi grup lain berjalan):
-      → Tunggu hingga selesai (timeout 60 detik)
-      → Jika timeout → tambah jeda 15 detik, lalu tetap jalankan
-    """
-    from video_call import _vc_scan_and_enforce
-
-    lock = get_lock_fn()
-    acquired = False
-    try:
-        acquired = await asyncio.wait_for(lock.acquire(), timeout=60.0)
-    except asyncio.TimeoutError:
-        # Tidak bisa dapat lock dalam 60 detik → jeda 15 detik lalu jalankan
-        print(
-            f"[UnmuteMic] Grup {chat_id}: inspeksi lain masih berjalan — "
-            "jeda 15 detik sebelum inspeksi dadakan."
-        )
-        await asyncio.sleep(15)
-
-    try:
-        print(f"[UnmuteMic] Grup {chat_id}: memulai inspeksi dadakan via /unmutemic.")
-        await _vc_scan_and_enforce(chat_id)
-    except Exception as e:
-        print(f"[UnmuteMic] Error inspeksi dadakan grup {chat_id}: {e}")
-    finally:
-        if acquired and lock.locked():
-            try:
-                lock.release()
-            except RuntimeError:
-                pass
+    # ── Antri scan VC ke worker ──────────────────────────────────────────────
+    # Worker yang mengatur giliran — tidak bentrok dengan siklus 30 menit.
+    print(f"[UnmuteMic] uid={uid} grup={cid}: antri scan VC (has_link={has_link}).")
+    _enqueue_vc_scan(cid)

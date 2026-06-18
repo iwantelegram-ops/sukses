@@ -215,11 +215,9 @@ async def _setup_commands():
     try:
         await app.set_bot_commands(
             commands=[
-                BotCommand("unmutemic", "unmute mic jka sdh hps/priv link bio"),
+                BotCommand("unmutemic", "hps / priv link bio sebelum klik ini"),
                 BotCommand("antigcast", "anti spam cerdas abad ini"),
                 BotCommand("spam", "balas pesan n masukin ke database AI"),
-           BotCommand("spam",      "balas pesan n masukin ke database AI"),
-                BotCommand("antigcast", "anti spam cerdas"),
             ],
             scope=BotCommandScopeAllGroupChats(),
         )

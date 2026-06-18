@@ -695,7 +695,8 @@ async def page_group_log(chat_id: int, page: int = 1):
         ])
         return text, keyboard
 
-    _ICON = {"HAPUS": "🗑", "MUTE": "🔇", "BAN": "⛔", "KICK-VC": "🎤", "SECOS": "🔐"}
+    _ICON = {"HAPUS": "🗑", "MUTE": "🔇", "BAN": "⛔", "KICK-VC": "🎤", "SECOS": "🔐",
+             "MUTE-VC-MIC": "🔇", "UNMUTE-VC-MIC": "🔊"}
 
     entries = []
     for d in docs:

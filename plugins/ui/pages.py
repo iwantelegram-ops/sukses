@@ -631,9 +631,9 @@ async def page_free_list(chat_id: int):
         del_buttons = [
             [InlineKeyboardButton(
                 f"🗑  Unvip: {doc['user_id']}",
-                callback_data=f"freedel_{chat_id}_{i}"
+                callback_data=f"freedel_{chat_id}_{doc['user_id']}"
             )]
-            for i, doc in enumerate(docs)
+            for doc in docs
         ]
     else:
         body = (

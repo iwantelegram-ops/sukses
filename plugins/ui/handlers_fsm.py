@@ -182,6 +182,12 @@ async def _handle_free_input(client, message: Message, user_id: int, state: dict
         {"$set": {"user_id": target_id, "chat_id": chat_id}},
         upsert=True,
     )
+    # Invalidasi cache VIP agar /unmutemic langsung mengenali status VIP baru.
+    try:
+        from video_call import invalidate_vip_cache
+        invalidate_vip_cache(chat_id, target_id)
+    except ImportError:
+        pass
 
     text, keyboard = await page_free_list(chat_id)
     header = (

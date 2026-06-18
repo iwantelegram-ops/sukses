@@ -519,16 +519,21 @@ async def cb_free_del(client, cb: CallbackQuery):
     try:
         m       = re.match(r"^freedel_(-?\d+)_(\d+)$", cb.data)
         chat_id = int(m.group(1))
-        index   = int(m.group(2))
+        target_user_id = int(m.group(2))
         user_id = cb.from_user.id
         if not await _adm_sess.verify_admin_session(client, user_id, chat_id):
             return await _deny_session(cb)
 
         from database import db
         _free_col = db["free_per_group"]
-        docs = [doc async for doc in _free_col.find({"chat_id": chat_id})]
-        if index < len(docs):
-            await _free_col.delete_one({"_id": docs[index]["_id"]})
+        await _free_col.delete_one({"chat_id": chat_id, "user_id": target_user_id})
+
+        # Invalidasi cache VIP agar perubahan langsung berlaku.
+        try:
+            from video_call import invalidate_vip_cache
+            invalidate_vip_cache(chat_id, target_user_id)
+        except ImportError:
+            pass
 
         text, keyboard = await page_free_list(chat_id)
         await safe_edit(cb.message, text, keyboard)

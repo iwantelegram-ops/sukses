@@ -118,282 +118,6 @@ _pending_warn_reason: dict[tuple[int, int], str] = {}
 # ── Global lock inspeksi dadakan via /unmutemic (hindari concurrent floodwait) ─
 _vc_inspection_lock: asyncio.Lock | None = None
 
-# ══════════════════════════════════════════════════════════════════════════════
-# VC JOIN/LEAVE WORKER — Antrean global join/leave obrolan suara
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# MASALAH YANG DISELESAIKAN:
-#   Tanpa worker ini, setiap panggilan _vc_scan_and_enforce dan
-#   _join_vc_for_group dari banyak grup berjalan paralel serentak.
-#   Telegram API tidak toleran terhadap banyak join/leave VC bersamaan
-#   dari satu akun userbot — bisa menyebabkan FloodWait, PEER_FLOOD,
-#   atau bahkan suspensi sementara akun userbot.
-#
-# SOLUSI:
-#   Semua permintaan join VC (dari scheduler 30 menit, dari enable Security OS,
-#   dari follow-up recheck) dimasukkan ke _vc_join_queue.
-#   Worker tunggal _vc_join_queue_worker mengeksekusi satu per satu
-#   dengan jeda _VC_WORKER_JOIN_DELAY detik antar join ke VC berbeda.
-#
-# ITEM QUEUE FORMAT:
-#   ("scan",    chat_id: int)          → jalankan _vc_scan_and_enforce
-#   ("leave",   chat_id: int)          → jalankan _leave_vc_for_group_direct
-#   ("join_now", chat_id: int)         → jalankan _join_vc_for_group_direct (darurat/enable)
-#
-# DEDUPLICATION:
-#   _vc_join_pending menyimpan set chat_id yang sudah antri. Jika chat_id
-#   sudah di-queue dan belum dikerjakan, permintaan baru TIDAK ditambah
-#   kecuali tipenya "leave" atau "join_now" (prioritas lebih tinggi).
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Antrean global join/leave VC — tuple (action, chat_id)
-_vc_join_queue: asyncio.Queue | None = None
-
-# Set chat_id yang sedang antri "scan" — cegah duplikat scan
-_vc_join_pending: set[int] = set()
-
-# Task worker join/leave VC
-_vc_join_worker_task: asyncio.Task | None = None
-
-# Jeda antar join VC ke grup berbeda (detik) — aman dari FloodWait
-_VC_WORKER_JOIN_DELAY = 8.0   # 8 detik jeda antar join ke grup berbeda
-
-# Jeda antar leave VC ke grup berbeda (detik)
-_VC_WORKER_LEAVE_DELAY = 3.0
-
-
-def _get_vc_join_queue() -> asyncio.Queue:
-    """Lazy-init antrean join VC dalam event loop aktif."""
-    global _vc_join_queue
-    if _vc_join_queue is None:
-        _vc_join_queue = asyncio.Queue()
-    return _vc_join_queue
-
-
-def _enqueue_vc_scan(chat_id: int) -> None:
-    """
-    Masukkan permintaan scan VC grup ke antrean global.
-    Jika chat_id sudah antri (tipe scan), request baru diabaikan (deduplicated).
-    Spawn worker jika belum ada.
-    """
-    global _vc_join_worker_task
-    q = _get_vc_join_queue()
-    if chat_id in _vc_join_pending:
-        # Sudah antri — tidak perlu double-queue
-        print(f"[VC-Worker] Grup {chat_id} sudah antri scan — skip duplikat.")
-        return
-    _vc_join_pending.add(chat_id)
-    q.put_nowait(("scan", chat_id))
-    # Spawn worker jika belum ada atau sudah selesai
-    if _vc_join_worker_task is None or _vc_join_worker_task.done():
-        _vc_join_worker_task = _safe_task(_vc_join_queue_worker(), tag="vc-join-worker")
-        print("[VC-Worker] Worker join VC di-spawn.")
-
-
-def _enqueue_vc_join_now(chat_id: int) -> None:
-    """
-    Masukkan permintaan join segera (saat enable Security OS).
-    Tipe 'join_now' selalu masuk antrean (tidak deduplicated) — prioritas enable.
-    """
-    global _vc_join_worker_task
-    q = _get_vc_join_queue()
-    q.put_nowait(("join_now", chat_id))
-    if _vc_join_worker_task is None or _vc_join_worker_task.done():
-        _vc_join_worker_task = _safe_task(_vc_join_queue_worker(), tag="vc-join-worker")
-        print("[VC-Worker] Worker join VC di-spawn (join_now).")
-
-
-def _enqueue_vc_leave(chat_id: int) -> None:
-    """
-    Masukkan permintaan leave VC grup ke antrean global.
-    Tipe 'leave' selalu masuk (tidak cek deduplicated) — harus dieksekusi.
-    """
-    global _vc_join_worker_task
-    q = _get_vc_join_queue()
-    # Hapus dari pending scan jika ada — leave lebih prioritas
-    _vc_join_pending.discard(chat_id)
-    q.put_nowait(("leave", chat_id))
-    if _vc_join_worker_task is None or _vc_join_worker_task.done():
-        _vc_join_worker_task = _safe_task(_vc_join_queue_worker(), tag="vc-join-worker")
-        print("[VC-Worker] Worker join VC di-spawn (leave).")
-
-
-async def _vc_join_queue_worker() -> None:
-    """
-    Worker tunggal antrean join/leave VC.
-
-    Mengeksekusi satu permintaan pada satu waktu — tidak pernah dua grup
-    join/leave VC bersamaan. Jeda _VC_WORKER_JOIN_DELAY detik setelah
-    setiap join, _VC_WORKER_LEAVE_DELAY setelah setiap leave.
-
-    Loop berhenti saat antrean kosong — akan di-spawn ulang saat ada item baru.
-    """
-    q = _get_vc_join_queue()
-    print("[VC-Worker] Worker join VC mulai berjalan.")
-    while True:
-        try:
-            action, chat_id = q.get_nowait()
-        except asyncio.QueueEmpty:
-            break
-
-        try:
-            if action == "scan":
-                print(f"[VC-Worker] Eksekusi scan VC grup {chat_id}...")
-                await _vc_scan_and_enforce(chat_id)
-                _vc_join_pending.discard(chat_id)
-                if not q.empty():
-                    await asyncio.sleep(_VC_WORKER_JOIN_DELAY)
-
-            elif action == "join_now":
-                print(f"[VC-Worker] Eksekusi join_now VC grup {chat_id}...")
-                await _join_vc_for_group_direct(chat_id)
-                if not q.empty():
-                    await asyncio.sleep(_VC_WORKER_JOIN_DELAY)
-
-            elif action == "leave":
-                print(f"[VC-Worker] Eksekusi leave VC grup {chat_id}...")
-                await _leave_vc_for_group_direct(chat_id)
-                if not q.empty():
-                    await asyncio.sleep(_VC_WORKER_LEAVE_DELAY)
-
-        except Exception as e:
-            print(f"[VC-Worker] Error saat proses action={action} grup={chat_id}: {e}")
-            _vc_join_pending.discard(chat_id)
-
-        q.task_done()
-
-    print("[VC-Worker] Worker join VC selesai (antrean kosong).")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MIC ACTION WORKER — Antrean mute/unmute mic per grup
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# MASALAH YANG DISELESAIKAN:
-#   _kick_from_voice dan _unmute_user_in_vc bisa terpanggil bersamaan
-#   untuk banyak user di grup yang sama dalam satu siklus scan.
-#   Eksekusi bersamaan membebani API dan menyebabkan FloodWait.
-#   Juga: tindakan mic untuk grup yang berbeda bisa berjalan paralel
-#   tanpa batas, memperparah kondisi flood.
-#
-# SOLUSI:
-#   Setiap tindakan mute/unmute mic dimasukkan ke _mic_queues[chat_id].
-#   Satu worker per grup mengeksekusi tindakan mic satu per satu
-#   dengan jeda _MIC_WORKER_DELAY detik antar tindakan.
-#
-# ITEM QUEUE FORMAT:
-#   ("mute",   user_id: int, call_input, reason: str)
-#   ("unmute", user_id: int, call_input, reason: str)
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Antrean mic per grup — {chat_id: asyncio.Queue}
-_mic_queues: dict[int, asyncio.Queue] = {}
-
-# Task worker mic per grup — {chat_id: asyncio.Task}
-_mic_workers: dict[int, asyncio.Task] = {}
-
-# Set (chat_id, user_id) yang sudah antri mic action — cegah duplikat per user per grup
-_mic_pending: set[tuple[int, int]] = set()
-
-# Jeda antar tindakan mic dalam satu grup (detik)
-_MIC_WORKER_DELAY = 2.0
-
-
-def _get_mic_queue(chat_id: int) -> asyncio.Queue:
-    """Dapatkan / buat antrean mic untuk grup ini."""
-    if chat_id not in _mic_queues:
-        _mic_queues[chat_id] = asyncio.Queue()
-    return _mic_queues[chat_id]
-
-
-def _enqueue_mute_mic(
-    chat_id: int,
-    user_id: int,
-    call_input,
-    reason: str = "bio mengandung link",
-) -> None:
-    """
-    Masukkan permintaan mute mic ke antrean grup ini.
-    Jika (chat_id, user_id) sudah antri tindakan mic, skip duplikat.
-    Spawn worker jika belum ada.
-    """
-    key = (chat_id, user_id)
-    if key in _mic_pending:
-        print(f"[Mic-Worker] uid={user_id} grup={chat_id} sudah antri mic action — skip duplikat.")
-        return
-    _mic_pending.add(key)
-    q = _get_mic_queue(chat_id)
-    q.put_nowait(("mute", user_id, call_input, reason))
-    _ensure_mic_worker(chat_id)
-
-
-def _enqueue_unmute_mic(
-    chat_id: int,
-    user_id: int,
-    call_input,
-    reason: str = "bio bersih",
-) -> None:
-    """
-    Masukkan permintaan unmute mic ke antrean grup ini.
-    Jika (chat_id, user_id) sudah antri tindakan mic, skip duplikat.
-    Spawn worker jika belum ada.
-    """
-    key = (chat_id, user_id)
-    if key in _mic_pending:
-        print(f"[Mic-Worker] uid={user_id} grup={chat_id} sudah antri unmute — skip duplikat.")
-        return
-    _mic_pending.add(key)
-    q = _get_mic_queue(chat_id)
-    q.put_nowait(("unmute", user_id, call_input, reason))
-    _ensure_mic_worker(chat_id)
-
-
-def _ensure_mic_worker(chat_id: int) -> None:
-    """Spawn worker mic untuk grup jika belum ada atau sudah selesai."""
-    existing = _mic_workers.get(chat_id)
-    if existing is None or existing.done():
-        task = _safe_task(_mic_action_worker(chat_id), tag=f"mic-worker-{chat_id}")
-        _mic_workers[chat_id] = task
-
-
-async def _mic_action_worker(chat_id: int) -> None:
-    """
-    Worker antrean mute/unmute mic per grup.
-
-    Mengeksekusi tindakan mic satu per satu dengan jeda _MIC_WORKER_DELAY
-    detik antar tindakan. Berhenti saat antrean kosong — akan di-spawn
-    ulang oleh _enqueue_mute_mic/_enqueue_unmute_mic saat ada item baru.
-    """
-    q = _get_mic_queue(chat_id)
-    print(f"[Mic-Worker] Worker mic grup {chat_id} mulai berjalan.")
-    while True:
-        try:
-            item = q.get_nowait()
-        except asyncio.QueueEmpty:
-            break
-
-        action, user_id, call_input, reason = item
-        key = (chat_id, user_id)
-        try:
-            if action == "mute":
-                print(f"[Mic-Worker] Mute mic uid={user_id} grup={chat_id} — alasan: {reason}")
-                await _kick_from_voice(chat_id, user_id, call_input)
-            elif action == "unmute":
-                print(f"[Mic-Worker] Unmute mic uid={user_id} grup={chat_id} — alasan: {reason}")
-                await _unmute_user_in_vc(chat_id, user_id, call_input)
-        except Exception as e:
-            print(f"[Mic-Worker] Error {action} uid={user_id} grup={chat_id}: {e}")
-        finally:
-            _mic_pending.discard(key)
-
-        q.task_done()
-        if not q.empty():
-            await asyncio.sleep(_MIC_WORKER_DELAY)
-
-    # Worker selesai — hapus referensi agar bisa dibuat ulang
-    _mic_workers.pop(chat_id, None)
-    print(f"[Mic-Worker] Worker mic grup {chat_id} selesai (antrean kosong).")
-
 
 def get_vc_inspection_lock() -> asyncio.Lock:
     """Return (atau buat) lock inspeksi dadakan. Aman dipanggil dari event loop manapun."""
@@ -1549,15 +1273,16 @@ async def _vc_scheduled_loop() -> None:
             continue
 
         if docs:
-            print(f"[UB-VC-Sched] Mulai siklus — {len(docs)} grup aktif → antri ke VC worker.")
-            for doc in docs:
+            print(f"[UB-VC-Sched] Mulai siklus — {len(docs)} grup aktif.")
+            for i, doc in enumerate(docs):
                 if not userbot or not _ub_ready:
                     break
                 chat_id = doc.get("chat_id")
                 if not chat_id:
                     continue
-                # Antri ke worker — worker yang atur jeda antar grup, tidak parallel
-                _enqueue_vc_scan(chat_id)
+                if i > 0:
+                    await asyncio.sleep(10)   # stagger antar grup
+                asyncio.create_task(_vc_scan_and_enforce(chat_id))
         else:
             print("[UB-VC-Sched] Tidak ada grup aktif — tidur 60 detik.")
             await asyncio.sleep(60)
@@ -1653,11 +1378,11 @@ async def _warmup_active_calls() -> None:
         await asyncio.sleep(2)
 
 
-async def _leave_vc_for_group_direct(chat_id: int) -> None:
+async def _leave_vc_for_group(chat_id: int) -> None:
     """
-    [INTERNAL] Paksa userbot keluar dari obrolan suara grup ini.
-    Dipanggil HANYA oleh _vc_join_queue_worker — jangan panggil langsung.
-    Gunakan _enqueue_vc_leave(chat_id) untuk antri permintaan leave.
+    Paksa userbot keluar dari obrolan suara grup ini.
+    Dipanggil saat Security OS dinonaktifkan admin atau saat redeploy
+    dan status Security OS grup ini adalah nonaktif.
 
     Menggunakan phone.LeaveGroupCall (MTProto raw API).
     Jika userbot tidak ada di VC, operasi ini aman (tidak error fatal).
@@ -1715,32 +1440,16 @@ async def _leave_vc_for_group_direct(chat_id: int) -> None:
             print(f"[UB-VC-Leave] Grup {chat_id}: error leave VC — {e}")
 
 
-async def _join_vc_for_group_direct(chat_id: int) -> None:
+async def _join_vc_for_group(chat_id: int) -> None:
     """
-    [INTERNAL] Dipanggil saat admin mengaktifkan Security OS.
-    Dipanggil HANYA oleh _vc_join_queue_worker — jangan panggil langsung.
-    Gunakan _enqueue_vc_join_now(chat_id) untuk antri permintaan join darurat.
+    Dipanggil saat admin mengaktifkan Security OS.
+    Arsitektur baru: tidak join langsung — langsung jalankan satu siklus scan sekarang,
+    lalu scheduler 30 menit yang akan menangani siklus berikutnya.
     """
     if not userbot or not _ub_ready:
         return
     print(f"[UB-VC-Join] Security OS diaktifkan grup {chat_id} — jalankan siklus scan segera.")
-    await _vc_scan_and_enforce(chat_id)
-
-
-async def _leave_vc_for_group(chat_id: int) -> None:
-    """
-    Antri permintaan leave VC untuk grup ini ke _vc_join_queue_worker.
-    Dieksekusi berurutan — tidak pernah bersamaan dengan join/leave grup lain.
-    """
-    _enqueue_vc_leave(chat_id)
-
-
-async def _join_vc_for_group(chat_id: int) -> None:
-    """
-    Antri permintaan join/scan VC untuk grup ini ke _vc_join_queue_worker.
-    Dieksekusi berurutan — tidak pernah bersamaan dengan join/leave grup lain.
-    """
-    _enqueue_vc_join_now(chat_id)
+    asyncio.create_task(_vc_scan_and_enforce(chat_id))
 
 
 def _build_input_group_call(call_id: int):
@@ -1827,26 +1536,10 @@ async def _query_monitor_then_kick(
     """
     try:
         # ── VIP Guard: cek paling awal — sebelum non-member dan bio check ─────
-        # User VIP (free_per_group) bebas dari aturan mute Security OS.
-        # TAPI: jika VIP sedang di-mute oleh userbot (vc_muted_by_ub) dan
-        # mic-nya sedang muted (is_muted=True) → unmute mic VIP tersebut.
-        # Ini dipakai saat VIP kirim /unmutemic dan userbot naik VC untuk scan.
+        # User VIP (free_per_group) bebas dari SEMUA aturan Security OS.
+        # Cache 3 menit agar tidak spam DB di setiap event VC.
         if await _is_vip_user(chat_id, user_id):
-            if is_muted:
-                was_ub_muted = muted_by_you or await _ub_muted_this_user(chat_id, user_id)
-                if was_ub_muted:
-                    print(
-                        f"[UB-VC] uid={user_id} grup={chat_id}: VIP + di-mute userbot "
-                        "→ unmute mic VIP."
-                    )
-                    _enqueue_unmute_mic(chat_id, user_id, call_input, "VIP — mic diaktifkan kembali")
-                else:
-                    print(
-                        f"[UB-VC] uid={user_id} grup={chat_id}: VIP muted oleh admin lain "
-                        "→ tidak di-unmute userbot."
-                    )
-            else:
-                print(f"[UB-VC] uid={user_id} grup={chat_id}: VIP → skip semua cek Security OS.")
+            print(f"[UB-VC] uid={user_id} grup={chat_id}: VIP → skip semua cek Security OS.")
             _processing_kick.discard((chat_id, user_id))
             return
 
@@ -1924,10 +1617,12 @@ async def _query_monitor_then_kick(
                     src_label = "Telegram API" if muted_by_you else "DB record"
                     print(
                         f"[UB-Unmute] uid={user_id} grup={chat_id}: "
-                        f"{reason} ({src_label}) → antri unmute mic ke worker."
+                        f"{reason} ({src_label}) → unmute mic."
                     )
-                    # Antri unmute ke worker (bukan panggil langsung — aman API per grup)
-                    _enqueue_unmute_mic(chat_id, user_id, call_input, reason)
+                    _safe_task(
+                        _unmute_user_in_vc(chat_id, user_id, call_input),
+                        tag="unmute-vc",
+                    )
                 else:
                     print(
                         f"[UB-Unmute] uid={user_id} grup={chat_id}: "
@@ -2079,17 +1774,15 @@ async def _secos_followup_recheck(chat_id: int, muted_users: list[tuple[int, str
         _secos_followup_tasks.pop(chat_id, None)
         return
 
-    print(f"[SecOS-FollowUp] Grup {chat_id}: 1 menit berlalu — antri scan VC ke worker.")
+    print(f"[SecOS-FollowUp] Grup {chat_id}: 1 menit berlalu — naik VC untuk cek ulang.")
 
     # Invalidasi cache member & bio semua user yang di-mute agar cek fresh
     for uid, _ in muted_users:
         _member_cache.pop((chat_id, uid), None)
         _bio_cache.pop((chat_id, uid), None)
 
-    # Antri scan ke worker (bukan langsung — aman API, tidak bentrok dengan siklus lain)
-    _enqueue_vc_scan(chat_id)
-    # Tunggu sebentar agar worker sempat proses scan sebelum kita cek hasilnya
-    await asyncio.sleep(_VC_WORKER_JOIN_DELAY + 35)   # jeda join + estimasi durasi scan
+    # Naik VC dan scan (di luar jadwal rutin)
+    await _vc_scan_and_enforce(chat_id)
 
     # ── Periksa siapa yang masih belum valid setelah cek 1 menit ─────────────
     still_invalid: list[tuple[int, str]] = []
@@ -2147,17 +1840,14 @@ async def _secos_followup_recheck(chat_id: int, muted_users: list[tuple[int, str
         _secos_followup_tasks.pop(chat_id, None)
         return
 
-    print(f"[SecOS-FollowUp] Grup {chat_id}: 5 menit berlalu — antri scan VC terakhir ke worker.")
+    print(f"[SecOS-FollowUp] Grup {chat_id}: 5 menit berlalu — naik VC untuk cek terakhir.")
 
     # Invalidasi cache lagi sebelum scan ulang
     for uid, _ in still_invalid:
         _member_cache.pop((chat_id, uid), None)
         _bio_cache.pop((chat_id, uid), None)
 
-    # Antri scan ke worker untuk cek terakhir
-    _enqueue_vc_scan(chat_id)
-    # Tunggu agar worker sempat proses sebelum follow-up task selesai
-    await asyncio.sleep(_VC_WORKER_JOIN_DELAY + 35)
+    await _vc_scan_and_enforce(chat_id)
 
     # ── Fitur 4: Selesai — kembali ke jadwal 30 menit normal ─────────────────
     # _vc_scheduled_loop tetap berjalan sendiri, tidak perlu tindakan tambahan.
@@ -2324,6 +2014,7 @@ async def _is_vip_user(chat_id: int, user_id: int) -> bool:
         db, _, _ = _get_db()
         doc = await db["free_per_group"].find_one(
             {"user_id": user_id, "chat_id": chat_id},
+            projection={"_id": 1},   # minimal projection — hanya butuh ada/tidak
         )
         is_vip = doc is not None
         _vip_cache[key] = (is_vip, time.monotonic())
@@ -2399,22 +2090,6 @@ async def _cache_cleanup_loop() -> None:
         for cid in done_followup:
             _secos_followup_tasks.pop(cid, None)
 
-        # Mic workers — bersihkan referensi task yang sudah selesai
-        done_mic = [cid for cid, t in list(_mic_workers.items()) if t.done()]
-        for cid in done_mic:
-            _mic_workers.pop(cid, None)
-
-        # Mic pending — bersihkan entri yang mungkin stuck (worker crash tanpa finally)
-        # Normalnya _mic_pending dibersihkan di finally worker, ini safety net.
-        if len(_mic_pending) > 50:
-            print(f"[UB-Cache] ⚠️ _mic_pending: {len(_mic_pending)} entri — kemungkinan ada yang stuck, reset.")
-            _mic_pending.clear()
-
-        # VC join pending — bersihkan jika terlalu besar (worker restart atau crash)
-        if len(_vc_join_pending) > 20:
-            print(f"[UB-Cache] ⚠️ _vc_join_pending: {len(_vc_join_pending)} entri — reset.")
-            _vc_join_pending.clear()
-
         # Processing kick safety: log jika terlalu besar (bisa ada yang stuck)
         stuck_count = len(_processing_kick)
         if stuck_count > 30:
@@ -2459,46 +2134,41 @@ async def _execute_kick(
     """
     Mute mic user dari voice chat, lalu antrekan peringatan ke grup.
 
-    was_already_muted=True berarti user SUDAH di-mute sebelum userbot bertindak.
-    Dalam kasus ini: SKIP sepenuhnya — tidak mute ulang, tidak LOG_OS, tidak notif.
-    LOG_OS dan notif hanya dikirim untuk PERUBAHAN STATUS NYATA (unmuted → muted).
+    was_already_muted=True berarti user sudah di-mute SEBELUM userbot bertindak
+    (mis: di-mute admin lain atau di-mute userbot di sesi sebelumnya).
+    Dalam kasus ini: lakukan mute ulang (agar tindakan konsisten), tapi
+    TIDAK kirim notifikasi ke grup — notif hanya untuk perubahan status.
 
     reason: alasan mute — diteruskan ke _do_send_warning dan LOG_OS.
 
-    Alur (dengan Mic Worker Queue):
-      1. Jika was_already_muted=True → skip seluruhnya (tidak ada perubahan status)
-      2. Antri mute mic ke _mic_action_worker → _kick_from_voice
-         → Jika API return sudah-muted (GROUP_CALL_NOT_MODIFIED) → skip LOG_OS
-      3. LOG_OS hanya jika benar-benar terjadi perubahan status (unmuted → muted)
-      4. Catat ke DB (vc_muted_by_ub)
-      5. Antrekan notifikasi grup hanya jika perubahan status nyata
+    Alur:
+      1. Mute mic via _kick_from_voice
+      2. Log ke LOG_OS (Perubahan 2)
+      3. Catat ke DB (vc_muted_by_ub) bahwa userbot yang mute-kan
+      4. Antrekan notifikasi HANYA jika ini perubahan status (was_already_muted=False)
     """
     try:
         # ── VIP Guard — cek sebelum APAPUN ────────────────────────────────────
+        # User VIP (free_per_group) bebas dari semua tindakan Security OS.
+        # Termasuk mute non-member, mute bio-link, dan re-mute dari cache.
         if await _is_vip_user(chat_id, user_id):
             print(f"[UB-Exec] uid={user_id} grup={chat_id}: VIP → skip mute mic Security OS.")
             return
 
-        # ── Poin 1: Skip jika sudah muted — tidak ada perubahan status ────────
-        # was_already_muted=True berarti Telegram sudah melaporkan user ini muted.
-        # Mute ulang tidak akan mengubah apapun; LOG_OS dan notif tidak relevan.
-        if was_already_muted:
-            print(
-                f"[UB-Exec] uid={user_id} grup={chat_id}: "
-                "sudah muted sebelumnya → skip (tidak mute ulang, tidak LOG_OS, tidak notif)."
-            )
-            return
-
-        # ── Antri mute mic ke worker — eksekusi berurutan per grup ────────────
-        _enqueue_mute_mic(chat_id, user_id, call_input, reason)
-        # LOG_OS: perubahan status nyata (unmuted → muted) — dicatat di sini
+        await _kick_from_voice(chat_id, user_id, call_input)
+        # Perubahan 2: log ke channel LOG_OS
         _safe_task(_log_os_action(chat_id, user_id, "MUTE-MIC", reason), tag="log-os")
         # Catat ke DB bahwa userbot yang mute-kan user ini
         _safe_task(_record_ub_muted(chat_id, user_id), tag="record-muted")
-        # Notifikasi grup: perubahan status nyata
-        _pending_warn_reason[(chat_id, user_id)] = reason
-        _enqueue_warning(chat_id, user_id)
-
+        # Antrekan notifikasi HANYA jika ini perubahan status
+        if not was_already_muted:
+            _pending_warn_reason[(chat_id, user_id)] = reason
+            _enqueue_warning(chat_id, user_id)
+        else:
+            print(
+                f"[UB-Exec] uid={user_id} grup={chat_id}: "
+                "sudah muted sebelumnya — mute ulang tanpa notifikasi ke grup"
+            )
     except Exception as e:
         print(f"[UB-Exec] Error saat kick uid={user_id} di grup {chat_id}: {e}")
     finally:
@@ -2662,19 +2332,6 @@ async def _unmute_user_in_vc(chat_id: int, user_id: int, call_input) -> None:
             except Exception as e:
                 print(f"[UB-Unmute] Gagal kirim notif unmute uid={user_id}: {e}")
 
-            # Catat ke log aktivitas grup — perubahan status nyata (muted → unmuted)
-            try:
-                from database import insert_group_action_log
-                await insert_group_action_log(
-                    chat_id,
-                    "UNMUTE-VC-MIC",
-                    "Security OS: mic diaktifkan kembali (bio bersih / tidak ada link)",
-                    user_id,
-                    name[:50],
-                )
-            except Exception as _e_log:
-                print(f"[UB-Unmute] Gagal catat log unmute uid={user_id}: {_e_log}")
-
     except FloodWait as fw:
         print(f"[UB-VC] FloodWait {fw.value}s saat unmute uid={user_id} — menunggu & retry...")
         await asyncio.sleep(fw.value + 1)
@@ -2757,18 +2414,10 @@ async def _do_send_warning(chat_id: int, user_id: int) -> None:
             asyncio.create_task(_auto_delete_warn())
 
         # Catat ke log aktivitas grup (fungsi asli database.py)
-        # Tentukan label alasan yang tepat berdasarkan warn_reason
-        if "non-member" in warn_reason:
-            log_alasan = "Security OS: bukan anggota grup, mic di-mute di obrolan suara"
-        elif "peer tidak dikenal" in warn_reason or "peer_invalid" in warn_reason:
-            log_alasan = "Security OS: profil belum terverifikasi, mic di-mute sementara"
-        else:
-            log_alasan = "Security OS: bio mengandung link, mic di-mute di obrolan suara"
-
         await insert_group_action_log(
             chat_id,
             "MUTE-VC-MIC",
-            log_alasan,
+            "Security OS: link di bio, mic di-mute di voice chat",
             user_id,
             name[:50],
         )
@@ -3057,9 +2706,9 @@ async def security_os_disable(chat_id: int) -> None:
     """
     await _sec_os_set_enabled(chat_id, False)
 
-    # ── Paksa userbot turun dari VC via worker (antri — tidak langsung) ──────
+    # ── Paksa userbot turun dari VC ──────────────────────────────────────────
     if userbot and _ub_ready:
-        _enqueue_vc_leave(chat_id)
+        asyncio.create_task(_leave_vc_for_group(chat_id))
 
     # ── Bot pemantau TIDAK dimatikan — selalu standby (bio.py juga memakainya)
     print(f"[SecOS] Security OS dinonaktifkan grup {chat_id} — bot pemantau tetap aktif.")

@@ -73,7 +73,7 @@ _MEM_CACHE_TTL = float(os.environ.get("BIO_TTL_SECS", 60))
 # Untuk mencegah force_check_user dipanggil terlalu sering dari sisi bot utama.
 # Key: (chat_id, user_id), Value: timestamp terakhir trigger
 _typing_trigger_ts: dict[tuple[int, int], float] = {}
-_TYPING_TRIGGER_COOLDOWN = 60.0  # minimal 60 detik antar trigger dari bot utama
+_TYPING_TRIGGER_COOLDOWN = _MEM_CACHE_TTL  # ikut BIO_TTL_SECS — konsisten dgn cache lain
 
 
 async def _query_bio_for_group(chat_id: int, user_id: int) -> bool | None:
